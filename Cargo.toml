@@ -1,6 +1,6 @@
 [package]
 name = "rag"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 description = "Local RAG for ZCode: manual file indexing with LM Studio embeddings, SIMD search, cost/utility stats."
 

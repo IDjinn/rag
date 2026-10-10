@@ -26,10 +26,11 @@ statistics so you can tell whether it is paying off.
   memory-mapped vectors (zero-copy search), rayon-parallel scoring, parallel
   file hashing/chunking, `target-cpu=native` + fat LTO. See the
   `throughput_report` test (`cargo test throughput_report -- --nocapture`).
-- **Statistics** — embedding tokens/time/requests, searches served, context
-  delivered vs full-file reads avoided, jev-judged usefulness rate, and a
-  verdict line. With a cloud provider, set `RAG_PRICE_PER_1M_TOKENS` to get
-  estimated USD spend.
+- **Statistics** — embedding tokens/time/requests, searches served, tokens
+  saved per search (full-file reads avoided minus context delivered,
+  including a savings-over-time bar chart), jev-judged usefulness rate, and
+  a verdict line. With a cloud provider, set `RAG_PRICE_PER_1M_TOKENS` to
+  get estimated USD spend.
 
 ## Usage
 

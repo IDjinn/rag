@@ -761,6 +761,8 @@ pub async fn search(query: &str, k: Option<usize>, path: Option<&str>, judge: bo
                 ms: elapsed,
                 judged_count: Some(0),
                 useful_count: Some(0),
+                delivered_tokens: delivered,
+                saved_tokens: full.saturating_sub(delivered),
             },
         );
         stats::save(&store.dir, &s);
@@ -846,6 +848,32 @@ pub fn feedback_verdicts(verdicts: Vec<FeedbackVerdict>, path: Option<&str>) -> 
     ))
 }
 
+/// Rows in the stats savings chart and the width of its longest bar.
+const SAVINGS_CHART_ROWS: usize = 20;
+const SAVINGS_BAR_WIDTH: usize = 24;
+
+/// Horizontal bar chart of net tokens saved per search (full-file reads
+/// avoided minus context delivered), oldest → newest, over the most recent
+/// `rows` history records. `None` when nothing shows a saving — including
+/// histories recorded before per-search token tracking existed.
+fn savings_chart(history: &[QueryRecord], rows: usize) -> Option<String> {
+    let recent: Vec<&QueryRecord> = history.iter().take(rows).collect();
+    let max_saved = recent.iter().map(|h| h.saved_tokens).max()?;
+    if max_saved == 0 {
+        return None;
+    }
+    let mut out = String::from("```text\n");
+    for h in recent.iter().rev() {
+        let when = h.ts.get(5..16).unwrap_or("--").replace('T', " ");
+        let bar_len =
+            ((h.saved_tokens as f64 / max_saved as f64) * SAVINGS_BAR_WIDTH as f64).round() as usize;
+        let bar = if bar_len == 0 { "·".to_string() } else { "█".repeat(bar_len) };
+        out.push_str(&format!("{when} │{bar} {}\n", fmt_tokens(h.saved_tokens)));
+    }
+    out.push_str("```");
+    Some(out)
+}
+
 pub fn stats(root_path: Option<&str>, reset: bool) -> Result<String> {
     let root = resolve_root(root_path);
     let store = Store::for_root(&root);
@@ -860,7 +888,8 @@ pub fn stats(root_path: Option<&str>, reset: bool) -> Result<String> {
 
     let hit_rate = if s.searches > 0 { s.search_hits * 100 / s.searches } else { 0 };
     let useful_rate = if s.judged_chunks > 0 { Some(s.useful_chunks * 100 / s.judged_chunks) } else { None };
-    let embed_per_search = if s.searches > 0 { s.embed_tokens / s.searches } else { s.embed_tokens };
+    let saved_total = s.full_file_tokens_avoided.saturating_sub(s.context_tokens_delivered);
+    let saved_per_search = if s.searches > 0 { saved_total / s.searches } else { 0 };
     let ratio = if s.context_tokens_delivered > 0 {
         s.full_file_tokens_avoided as f64 / s.context_tokens_delivered as f64
     } else {
@@ -869,77 +898,60 @@ pub fn stats(root_path: Option<&str>, reset: bool) -> Result<String> {
     let disk_kb = store.disk_bytes() as f64 / 1024.0;
 
     let mut out = String::new();
-    out.push_str(&format!("## rag_stats\n\nRoot: `{}`\n\n", root.display()));
+    out.push_str("## rag_stats\n\n");
 
-    out.push_str("### Index\n\n");
     match &data {
         Some(d) => {
             let p0 = d.files.values().filter(|e| e.tier == Tier::P0).count();
             out.push_str(&format!(
-                "- Files: {} (P0: {p0}, P1: {}) | chunks: {} | dim: {} | provider: {} | model: `{}`\n",
+                "- **Index:** {} files (P0 {p0} · P1 {}) · {} chunks · dim {} · {disk_kb:.0} KB · model `{}` · last indexed {}\n",
                 d.files.len(),
                 d.files.len() - p0,
                 d.vector_count,
                 d.dim,
-                d.provider,
-                d.model
-            ));
-            out.push_str(&format!(
-                "- Last indexed: {} | disk: {disk_kb:.0} KB\n\n",
+                d.model,
                 d.updated_at
             ));
         }
-        None => out.push_str("- No index yet. Run `rag index` once (afterwards changes refresh automatically).\n\n"),
+        None => out.push_str("- **Index:** none yet — run `rag index` once.\n"),
     }
 
-    out.push_str("### Cost (local: time + tokens embedded)\n\n");
+    let usefulness = match useful_rate {
+        Some(rate) => format!("{rate}% ({}/{} chunks)", s.useful_chunks, s.judged_chunks),
+        None => "not measured".to_string(),
+    };
+    let search_errors = if s.search_errors > 0 {
+        format!(" · {} search errors", s.search_errors)
+    } else {
+        String::new()
+    };
     out.push_str(&format!(
-        "- Index runs: {} (last wall time: {})\n",
-        s.index_runs,
-        s.last_index_ms.map_or("n/a".to_string(), |ms| format!("{:.1}s", ms as f64 / 1000.0))
+        "- **Searches:** {} · {hit_rate}% hits · usefulness {usefulness}{search_errors}\n",
+        s.searches
     ));
     out.push_str(&format!(
-        "- Embedded so far: {} chunks / ~{} tokens / {:.1}s / {} requests / {} errors\n",
-        fmt_tokens(s.chunks_embedded),
-        fmt_tokens(s.embed_tokens),
-        s.embed_ms as f64 / 1000.0,
-        s.embed_requests,
-        s.embed_errors
-    ));
-    out.push_str(&format!("- Index disk: {disk_kb:.0} KB\n"));
-    if let Some(price) = config::price_per_1m_tokens() {
-        let usd = s.embed_tokens as f64 / 1e6 * price;
-        out.push_str(&format!(
-            "- Estimated embedding spend: ~${usd:.4} (at ${price:.4} / 1M tokens via RAG_PRICE_PER_1M_TOKENS)\n"
-        ));
-    }
-    out.push('\n');
-
-    out.push_str("### Utility\n\n");
-    out.push_str(&format!(
-        "- Searches: {} (errors: {}) | avg results: {:.1} | hit rate (top score ≥ {}): {hit_rate}%\n",
-        s.searches,
-        s.search_errors,
-        if s.searches > 0 { s.search_results as f64 / s.searches as f64 } else { 0.0 },
-        config::settings().search.hit_threshold
-    ));
-    out.push_str(&format!(
-        "- Context delivered: ~{} tokens | full-file reads avoided: ~{} tokens (×{ratio:.1})\n",
+        "- **Saved:** ~{}/search · ~{} total — ~{} delivered vs ~{} full-file reads (×{ratio:.1})\n",
+        fmt_tokens(saved_per_search),
+        fmt_tokens(saved_total),
         fmt_tokens(s.context_tokens_delivered),
         fmt_tokens(s.full_file_tokens_avoided)
     ));
-    match useful_rate {
-        Some(rate) => out.push_str(&format!(
-            "- Jev-judged usefulness: {rate}% ({}/{} chunks)\n",
-            s.useful_chunks, s.judged_chunks
-        )),
-        None => out.push_str(
-            "- Jev-judged usefulness: not measured yet (use rag_search with judge:true, then rag_feedback)\n",
-        ),
-    }
+
+    let amortized = if s.searches > 0 {
+        format!(" · ~{} tokens/search amortized", fmt_tokens(s.embed_tokens / s.searches))
+    } else {
+        String::new()
+    };
+    let spend = config::price_per_1m_tokens()
+        .map(|price| format!(" · ~${:.4} est. spend", s.embed_tokens as f64 / 1e6 * price))
+        .unwrap_or_default();
+    let embed_errors =
+        if s.embed_errors > 0 { format!(" · {} embed errors", s.embed_errors) } else { String::new() };
     out.push_str(&format!(
-        "- Index cost per search so far: ~{} embedded tokens (amortized)\n\n",
-        fmt_tokens(embed_per_search)
+        "- **Index cost:** {} run(s) · ~{} tokens embedded · {:.1}s{amortized}{spend}{embed_errors}\n",
+        s.index_runs,
+        fmt_tokens(s.embed_tokens),
+        s.embed_ms as f64 / 1000.0,
     ));
 
     let verdict = if s.searches == 0 {
@@ -953,10 +965,18 @@ pub fn stats(root_path: Option<&str>, reset: bool) -> Result<String> {
     } else {
         "Not paying off yet — few searches, or results nearly as big as the files."
     };
-    out.push_str(&format!("**Verdict:** {verdict}\n\n"));
+    out.push_str(&format!("\n**Verdict:** {verdict}\n"));
+
+    if let Some(chart) = savings_chart(&s.history, SAVINGS_CHART_ROWS) {
+        out.push_str(&format!(
+            "\n### Savings per search (older → newer, last ≤{SAVINGS_CHART_ROWS})\n\n{chart}\n"
+        ));
+    } else if s.searches > 0 {
+        out.push_str("\n_No per-search savings to chart yet._\n");
+    }
 
     if !s.history.is_empty() {
-        out.push_str("### Recent queries\n\n| when | query | results | top score | judged |\n|---|---|---|---|---|\n");
+        out.push_str("\n### Recent queries\n\n| when | query | results | top score | judged |\n|---|---|---|---|---|\n");
         for h in s.history.iter().take(10) {
             let judged = h
                 .judged_count
@@ -966,9 +986,8 @@ pub fn stats(root_path: Option<&str>, reset: bool) -> Result<String> {
             let query = h.query.chars().take(40).collect::<String>().replace('|', "\\|");
             out.push_str(&format!("| {when} | {query} | {} | {:.2} | {judged} |\n", h.results, h.top_score));
         }
-        out.push('\n');
     }
-    out.push_str("Use `rag stats --reset` (or rag_stats with reset:true) to zero the counters (keeps the index).");
+    out.push_str("\nUse `rag stats --reset` (or rag_stats with reset:true) to zero the counters (keeps the index).");
     Ok(out)
 }
 
@@ -1148,5 +1167,60 @@ mod tests {
         // The store lock must be usable (poison-free) and relockable.
         drop(lock_store(&a));
         drop(lock_store(&a));
+    }
+
+    fn query_record(ts: &str, delivered: u64, saved: u64) -> QueryRecord {
+        QueryRecord {
+            ts: ts.to_string(),
+            query: "q".to_string(),
+            results: 1,
+            top_score: 0.5,
+            ms: 1,
+            judged_count: None,
+            useful_count: None,
+            delivered_tokens: delivered,
+            saved_tokens: saved,
+        }
+    }
+
+    #[test]
+    fn savings_chart_orders_oldest_first_and_scales_to_max() {
+        // Stored newest-first, as search() inserts at index 0.
+        let history = vec![
+            query_record("2026-10-10T09:30:00Z", 0, 2000),
+            query_record("2026-10-09T15:10:00Z", 0, 1000),
+            query_record("2026-10-09T14:02:00Z", 0, 0),
+        ];
+        let chart = savings_chart(&history, SAVINGS_CHART_ROWS).unwrap();
+        let lines: Vec<&str> = chart.lines().collect();
+        assert_eq!(lines.len(), 5); // fence + 3 rows + fence
+        let rows = &lines[1..4];
+        // Oldest first; a zero saving renders as a dot.
+        assert!(rows[0].starts_with("10-09 14:02 │· 0"));
+        // Half the max → half the bar; the max gets the full width.
+        assert_eq!(rows[1].matches('█').count(), SAVINGS_BAR_WIDTH / 2);
+        assert!(rows[2].starts_with("10-10 09:30 │"));
+        assert_eq!(rows[2].matches('█').count(), SAVINGS_BAR_WIDTH);
+    }
+
+    #[test]
+    fn savings_chart_keeps_the_newest_rows_only() {
+        let history: Vec<QueryRecord> = (0..25)
+            .rev()
+            .map(|i| query_record(&format!("2026-10-09T00:{i:02}:00Z"), 0, 100))
+            .collect(); // index 0 is the newest, as search() stores it
+        let chart = savings_chart(&history, SAVINGS_CHART_ROWS).unwrap();
+        assert_eq!(chart.lines().count(), SAVINGS_CHART_ROWS + 2); // fence + rows + fence
+        assert!(chart.contains("00:05")); // oldest of the newest 20 (indices 5..=24)
+        assert!(!chart.contains("00:04"));
+    }
+
+    #[test]
+    fn savings_chart_is_none_without_savings() {
+        let history: Vec<QueryRecord> = (0..3)
+            .map(|i| query_record(&format!("2026-10-09T00:{i:02}:00Z"), 10, 0))
+            .collect();
+        assert!(savings_chart(&history, SAVINGS_CHART_ROWS).is_none());
+        assert!(savings_chart(&[], SAVINGS_CHART_ROWS).is_none());
     }
 }

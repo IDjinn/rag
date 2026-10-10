@@ -11,6 +11,12 @@ pub struct QueryRecord {
     pub judged_count: Option<u64>,
     #[serde(default)]
     pub useful_count: Option<u64>,
+    /// Context tokens the results added, estimated (chars/4).
+    #[serde(default)]
+    pub delivered_tokens: u64,
+    /// Net saving: full-file tokens avoided minus tokens delivered.
+    #[serde(default)]
+    pub saved_tokens: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -63,4 +69,18 @@ pub fn save(dir: &std::path::Path, stats: &RagStats) {
 pub fn push_history(stats: &mut RagStats, record: QueryRecord) {
     stats.history.insert(0, record);
     stats.history.truncate(crate::config::HISTORY_LIMIT);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_record_defaults_missing_token_fields() {
+        // stats.json written before per-search token tracking existed.
+        let old = r#"{"ts":"2026-10-01T10:00:00Z","query":"q","results":3,"top_score":0.5,"ms":12}"#;
+        let rec: QueryRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(rec.delivered_tokens, 0);
+        assert_eq!(rec.saved_tokens, 0);
+    }
 }

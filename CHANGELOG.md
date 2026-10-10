@@ -4,6 +4,28 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.3.0 — 2026-10-10
+
+### Added
+
+- **Tokens saved per search** — `rag stats` now reports net savings
+  (full-file reads avoided minus context delivered) as a lifetime total and
+  a per-search average. Each search records its own token counts
+  (`delivered_tokens`/`saved_tokens` in the query history; older stats.json
+  files load unchanged and simply have no per-search values yet).
+- **Savings-over-time chart** — `rag stats` renders a horizontal bar chart
+  of the last 20 searches (oldest → newest) showing tokens saved per
+  search; a `·` marks searches with no net saving, and the chart appears
+  once searches start recording token counts.
+
+### Changed
+
+- **Simplified `rag stats` output** — the Index/Cost/Utility sections
+  collapsed into four summary lines (index shape, searches + usefulness,
+  saved tokens, index cost) followed by the verdict, the savings chart and
+  the recent-queries table. Error counts and estimated USD spend only show
+  when nonzero / when a price is configured.
+
 ## 0.2.2 — 2026-10-10
 
 ### Changed
