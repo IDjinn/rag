@@ -6,21 +6,24 @@ mod lmstudio;
 mod mcp;
 mod ops;
 mod progress;
+mod render;
 mod simd;
 mod stats;
 mod store;
 
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
 
 #[derive(Parser)]
 #[command(
     name = "rag",
     version,
-    about = "Local RAG for ZCode: manual first index + automatic incremental refresh, LM Studio embeddings, SIMD search, cost/utility stats."
+    about = "Local RAG for ZCode: manual first index + automatic incremental refresh, LM Studio embeddings, SIMD search, cost/utility stats.",
+    arg_required_else_help = true
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Command,
 }
 
 #[derive(Subcommand)]
@@ -91,7 +94,7 @@ enum Command {
         /// Root folder the index belongs to (default: current directory)
         path: Option<String>,
     },
-    /// Run as an MCP stdio server (default when no subcommand is given)
+    /// Run as an MCP stdio server (register it in ZCode with args: ["serve"])
     Serve,
     /// ZCode SessionStart hook: read the hook JSON on stdin and emit an
     /// additionalContext payload when the cwd has an index. Advisory only —
@@ -111,8 +114,8 @@ async fn main() {
     std::process::exit(run(cli.command).await);
 }
 
-async fn run(command: Option<Command>) -> i32 {
-    match command.unwrap_or(Command::Serve) {
+async fn run(command: Command) -> i32 {
+    match command {
         Command::Serve => return mcp::serve().await,
         Command::Index { path, force, dry_run, batch_size, concurrency, no_ignore, no_progress } => {
             report(
@@ -150,6 +153,13 @@ async fn run(command: Option<Command>) -> i32 {
 fn report(result: anyhow::Result<String>) -> i32 {
     match result {
         Ok(text) => {
+            // The ops layer speaks markdown (the MCP tools feed it to models);
+            // on a terminal the same text is laid out for humans instead.
+            let text = if std::io::stdout().is_terminal() {
+                render::render(&text)
+            } else {
+                text
+            };
             println!("{text}");
             0
         }

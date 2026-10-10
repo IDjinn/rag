@@ -40,10 +40,16 @@ rag stats [PATH] [--reset]
 rag status [PATH]
 rag clear [PATH]
 rag feedback --json '{"verdicts":[{"id":"r1","useful":true}]}' [PATH]
-rag serve        # MCP stdio server (also the default with no arguments)
-rag hook         # ZCode SessionStart hook: context when the cwd is indexed
+rag serve        # MCP stdio server (must be launched explicitly — bare `rag` prints help)
+rag hook         # ZCode hooks: SessionStart context + PreToolUse(Agent) reminder
 rag config [--init]
 ```
+
+Bare `rag` prints the help; the MCP server is launched as `rag serve`
+explicitly (the ZCode registration below passes `serve`). CLI reports are
+laid out for the terminal whenever stdout is a TTY — underlined headings,
+aligned tables, no raw markdown; piped/redirected output keeps the markdown
+format, and the MCP tools always speak markdown.
 
 As an MCP server it exposes `rag_status`, `rag_index`, `rag_search`,
 `rag_feedback`, `rag_stats`, `rag_clear`. `rag_search` with `judge:true`

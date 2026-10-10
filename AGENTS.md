@@ -3,7 +3,7 @@
 Single Rust binary providing local RAG for ZCode: manual file indexing into a
 local vector store (OpenAI-compatible embeddings — LM Studio by default,
 Ollama/cloud via `RAG_PROVIDER`), SIMD cosine search, cost/utility stats, and
-an MCP stdio server (`rag serve`, also the default command). See `README.md`
+an MCP stdio server (`rag serve`; bare `rag` prints help). See `README.md`
 for the full user-facing documentation.
 
 ## Layout
@@ -19,6 +19,8 @@ for the full user-facing documentation.
 - `src/chunk.rs`, `src/files.rs` — chunking; file discovery, P0/P1 tiers, ignore rules
 - `src/config.rs` — config precedence: CLI flag > `RAG_*` env > `~/.zcode/ia/config.yaml` > default
 - `src/stats.rs`, `src/ops.rs`, `src/progress.rs` — stats/feedback, commands, progress bars
+- `src/render.rs` — markdown → terminal layout for CLI output (TTY only; pipes
+  and the MCP tools keep the markdown reports authored in `ops.rs`)
 - `testdata/` — test fixtures (committed)
 - `.cargo/config.toml` — sets `target-cpu=native` on x86_64 (host-tuned dev builds)
 
@@ -71,7 +73,8 @@ committed (binary crate).
 5. Distributable builds must override `target-cpu=native` (see Gotchas) and
    strip/mmap-friendly release profile (`--release`).
 
-The intended mechanism is a `.github/workflows/release.yml` triggered by the
-tag push that builds each target on its native runner, overrides the native
-CPU flag, and attaches the archives to the release. It does not exist yet —
-creating it is part of the first release.
+The mechanism is `.github/workflows/release.yml` (triggers on `v*` tags): it
+builds each target on its native runner with `RUSTFLAGS` overriding the native
+CPU flag, and publishes the GitHub Release with the matching CHANGELOG section
+and the attached archives. Cutting a release is just: changelog, version bump,
+commit, tag, push (main + tag) — then verify the workflow run goes green.
