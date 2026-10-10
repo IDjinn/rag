@@ -1,6 +1,6 @@
 [package]
 name = "rag"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Local RAG for ZCode: manual file indexing with LM Studio embeddings, SIMD search, cost/utility stats."
 
@@ -11,6 +11,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 ignore = "0.4"
+globset = "0.4"
 rayon = "1"
 sha1 = "0.10"
 dirs = "5"
@@ -27,3 +28,4 @@ indicatif = "0.17"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+strip = true

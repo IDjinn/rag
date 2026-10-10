@@ -1,0 +1,84 @@
+name: release
+
+# Builds the 3 distributable targets on their native runners and publishes a
+# GitHub Release whose notes carry the matching CHANGELOG.md section.
+# Overrides the repo's dev-only `target-cpu=native` (.cargo/config.toml):
+# RUSTFLAGS set here takes precedence over cargo config rustflags.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            platform: linux-amd64
+            flags: "-C target-cpu=x86-64-v2"
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            platform: windows-amd64
+            flags: "-C target-cpu=x86-64-v2"
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            platform: macos-arm64
+            # Empty RUSTFLAGS = default (baseline) codegen for the triple.
+            flags: ""
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: ${{ matrix.flags }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: tar -czf rag-${{ github.ref_name }}-${{ matrix.platform }}.tar.gz -C target/${{ matrix.target }}/release rag
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path target/${{ matrix.target }}/release/rag.exe -DestinationPath rag-${{ github.ref_name }}-${{ matrix.platform }}.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rag-${{ github.ref_name }}-${{ matrix.platform }}
+          path: rag-${{ github.ref_name }}-${{ matrix.platform }}.*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: rag-*
+          merge-multiple: true
+      - name: Extract CHANGELOG section
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v ver="$VERSION" '
+            $0 ~ /^## / {
+              if (started) exit
+              if (index($0, "## " ver) == 1) started = 1
+              else next
+            }
+            started { print }
+          ' CHANGELOG.md > release-notes.md
+          [ -s release-notes.md ] || { echo "No CHANGELOG section for $VERSION" >&2; exit 1; }
+          cat release-notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body_path: release-notes.md
+          files: dist/rag-*
