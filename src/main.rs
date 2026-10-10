@@ -1,6 +1,7 @@
 mod chunk;
 mod config;
 mod files;
+mod hook;
 mod lmstudio;
 mod mcp;
 mod ops;
@@ -92,6 +93,10 @@ enum Command {
     },
     /// Run as an MCP stdio server (default when no subcommand is given)
     Serve,
+    /// ZCode SessionStart hook: read the hook JSON on stdin and emit an
+    /// additionalContext payload when the cwd has an index. Advisory only —
+    /// prints nothing when unindexed and always exits 0.
+    Hook,
     /// Show the effective YAML config, or write a default one with --init
     Config {
         /// Write a commented default config if none exists
@@ -132,6 +137,13 @@ async fn run(command: Option<Command>) -> i32 {
         Command::Status { path } => report(ops::status(path.as_deref()).await),
         Command::Clear { path } => report(ops::clear(path.as_deref()).await),
         Command::Feedback { json, path } => report(ops::feedback(&json, path.as_deref())),
+        Command::Hook => {
+            // A failing hook must never fail the session: swallow and exit 0.
+            if let Err(err) = hook::run() {
+                eprintln!("rag hook: {err:#}");
+            }
+            0
+        }
     }
 }
 
