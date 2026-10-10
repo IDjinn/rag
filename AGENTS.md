@@ -10,7 +10,8 @@ for the full user-facing documentation.
 
 - `src/main.rs` — clap CLI entry point
 - `src/mcp.rs` — MCP stdio server (rmcp): `rag_status/index/search/feedback/stats/clear`
-- `src/hook.rs` — ZCode SessionStart hook (`rag hook`): stdin JSON → `additionalContext`
+- `src/hook.rs` — ZCode hooks (`rag hook`): SessionStart index announcement +
+  PreToolUse(Agent) delegation reminder, both emitting `additionalContext`
   when the cwd is indexed; silent + exit 0 otherwise
 - `src/lmstudio.rs` — embeddings client (`/v1/embeddings`, provider-agnostic)
 - `src/store.rs` — index persistence + memory-mapped vectors

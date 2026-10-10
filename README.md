@@ -112,17 +112,22 @@ Point `command` at the built binary (e.g. `~/.cargo/bin/rag.exe` after
 `cargo install --path .`, or `target/release/rag.exe` inside a checkout).
 Restart the session (or Settings → MCP) after changing the file.
 
-## ZCode hook (SessionStart)
+## ZCode hooks (SessionStart + Agent delegation)
 
-`rag hook` turns ZCode's hook system into passive index awareness: on every
-session start (startup, resume, clear, and after compaction) it checks whether
-the session's working directory has an index and, if so, injects a short
-`additionalContext` note telling the agent to prefer `rag_search` over
-Grep/Glob for semantic code location. No index → it prints nothing, so
-unindexed repos stay completely untouched. It never touches the network and
-never blocks the session (always exits 0).
+`rag hook` turns ZCode's hook system into passive index awareness. It handles
+two events, both strictly advisory (unindexed directories get silence; it
+never touches the network and always exits 0):
 
-Register it in `~/.zcode/cli/config.json` next to the MCP server (same
+- **`SessionStart`** (startup, resume, clear, post-compact): injects a short
+  `additionalContext` note announcing the index and defining the flow —
+  `rag_search` first for semantic code location, exploration subagents only
+  as a fallback for what the index doesn't cover.
+- **`PreToolUse` on `Agent`**: fires at the moment the model spawns a
+  subagent and reminds it to run `rag_search` itself and paste the relevant
+  file:line hits into the subagent prompt (subagents start without the hook
+  context, and Explore agents have no MCP tool access).
+
+Register both in `~/.zcode/cli/config.json` next to the MCP server (same
 `command` path as above):
 
 ```json
@@ -134,6 +139,13 @@ Register it in `~/.zcode/cli/config.json` next to the MCP server (same
         { "type": "process", "command": "C:\\path\\to\\rag.exe",
           "args": ["hook"], "timeoutMs": 10000, "statusMessage": "Checking RAG index" }
       ] }
+    ],
+    "PreToolUse": [
+      { "matcher": "Agent|Task",
+        "hooks": [
+          { "type": "process", "command": "C:\\path\\to\\rag.exe",
+            "args": ["hook"], "timeoutMs": 10000, "statusMessage": "RAG: rag_search first" }
+        ] }
     ]
   }
 }
@@ -144,6 +156,7 @@ silence otherwise):
 
 ```bash
 echo '{"hook_event_name":"SessionStart","cwd":"/some/indexed/repo"}' | rag hook
+echo '{"hook_event_name":"PreToolUse","tool_name":"Agent","cwd":"/some/indexed/repo"}' | rag hook
 ```
 
 ## Performance notes (measured)
