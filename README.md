@@ -41,6 +41,8 @@ rag status [PATH]
 rag clear [PATH]
 rag feedback --json '{"verdicts":[{"id":"r1","useful":true}]}' [PATH]
 rag serve        # MCP stdio server (also the default with no arguments)
+rag hook         # ZCode SessionStart hook: context when the cwd is indexed
+rag config [--init]
 ```
 
 As an MCP server it exposes `rag_status`, `rag_index`, `rag_search`,
@@ -100,13 +102,49 @@ mixing vector spaces. If LM Studio unloads models on idle, re-run
 
 ```json
 "rag": {
-  "command": "C:\\dev\\ia\\rag\\target\\release\\rag.exe",
+  "command": "C:\\path\\to\\rag.exe",
   "args": ["serve"],
   "env": { "RAG_EMBED_MODEL": "qwen.qwen3-vl-embedding-2b" }
 }
 ```
 
+Point `command` at the built binary (e.g. `~/.cargo/bin/rag.exe` after
+`cargo install --path .`, or `target/release/rag.exe` inside a checkout).
 Restart the session (or Settings → MCP) after changing the file.
+
+## ZCode hook (SessionStart)
+
+`rag hook` turns ZCode's hook system into passive index awareness: on every
+session start (startup, resume, clear, and after compaction) it checks whether
+the session's working directory has an index and, if so, injects a short
+`additionalContext` note telling the agent to prefer `rag_search` over
+Grep/Glob for semantic code location. No index → it prints nothing, so
+unindexed repos stay completely untouched. It never touches the network and
+never blocks the session (always exits 0).
+
+Register it in `~/.zcode/cli/config.json` next to the MCP server (same
+`command` path as above):
+
+```json
+"hooks": {
+  "enabled": true,
+  "events": {
+    "SessionStart": [
+      { "hooks": [
+        { "type": "process", "command": "C:\\path\\to\\rag.exe",
+          "args": ["hook"], "timeoutMs": 10000, "statusMessage": "Checking RAG index" }
+      ] }
+    ]
+  }
+}
+```
+
+Manual check (mimics what ZCode pipes in; expect JSON on an indexed cwd and
+silence otherwise):
+
+```bash
+echo '{"hook_event_name":"SessionStart","cwd":"/some/indexed/repo"}' | rag hook
+```
 
 ## Performance notes (measured)
 
@@ -140,10 +178,25 @@ index:
   concurrency: 1
   auto_refresh: true              # MCP server re-embeds changed files automatically
   auto_refresh_interval_secs: 10  # how often watched roots are scanned
+  p0_exts: ["rs", "ts", "..."]    # full tier lists — see `rag config --init`
+  p1_exts: ["json", "yml", "..."]
+  p1_names: ["dockerfile", "..."]
+  dependency_files: ["cargo.lock", "..."]
+  p0_globs: []                    # e.g. ["**/migrations/**", "*.proto"]
+  p1_globs: []                    # e.g. ["**/*.csv", "**/fixtures/**"]
 search:
   k: 5
   p1_damp: 0.9
 ```
+
+The tier lists (`p0_exts`, `p1_exts`, `p1_names`, `dependency_files`,
+`p0_globs`, `p1_globs`) control which files get indexed and at which
+priority. A list present in the file **replaces** the built-in default
+entirely (`rag config --init` writes the full defaults out so every entry is
+visible and editable). Globs are matched case-insensitively against the
+root-relative path and the bare file name — `*` does not cross `/`, use
+`**/` for directories. Classification order: P1 names → extensions (P0, then
+P1) → P0 globs → P1 globs.
 
 ## On GPU
 

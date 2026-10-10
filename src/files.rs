@@ -13,27 +13,6 @@ pub struct DiscoveredFile {
     pub tier: Tier,
 }
 
-/// Dependency-tree files never worth embedding: anything named `*.lock` is
-/// already excluded (no "lock" extension in the tier lists); these have other
-/// extensions or none.
-const DEPENDENCY_FILES: &[&str] = &[
-    "cargo.lock",
-    "package-lock.json",
-    "yarn.lock",
-    "pnpm-lock.yaml",
-    "bun.lock",
-    "npm-shrinkwrap.json",
-    "composer.lock",
-    "gemfile.lock",
-    "pipfile.lock",
-    "poetry.lock",
-    "uv.lock",
-    "pdm.lock",
-    "go.sum",
-    "packages.lock.json",
-    "flake.lock",
-];
-
 /// Walk a root honoring .gitignore/.ignore/.git/info/exclude (nested and global),
 /// skipping hidden entries, non-whitelisted names and oversize files.
 pub fn walk(root: &Path, respect_ignore: bool) -> Vec<DiscoveredFile> {
@@ -52,6 +31,7 @@ pub fn walk(root: &Path, respect_ignore: bool) -> Vec<DiscoveredFile> {
     }
     builder.threads(std::thread::available_parallelism().map_or(4, |n| n.get()));
 
+    let dependency_files = &config::settings().index.dependency_files;
     let mut out: Vec<DiscoveredFile> = Vec::new();
     for entry in builder.build().flatten() {
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
@@ -61,10 +41,15 @@ pub fn walk(root: &Path, respect_ignore: bool) -> Vec<DiscoveredFile> {
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        let Some(tier) = config::tier_for(name) else {
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let Some(tier) = config::tier_for(&rel) else {
             continue;
         };
-        if DEPENDENCY_FILES.contains(&lower_name(name).as_str()) {
+        if dependency_files.iter().any(|d| d == &lower_name(name)) {
             continue;
         }
         let Ok(md) = entry.metadata() else { continue };
@@ -78,11 +63,6 @@ pub fn walk(root: &Path, respect_ignore: bool) -> Vec<DiscoveredFile> {
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
         out.push(DiscoveredFile {
             abs: path.to_path_buf(),
             rel,

@@ -35,6 +35,20 @@ pub struct IndexSettings {
     pub auto_refresh: bool,
     /// How often (seconds) the auto-refresh loop scans watched roots.
     pub auto_refresh_interval_secs: u64,
+    /// Extensions classified P0 ("core": source code and documentation).
+    pub p0_exts: Vec<String>,
+    /// Extensions classified P1 ("support": everything else textual).
+    pub p1_exts: Vec<String>,
+    /// Whole file names (no extension semantics) always classified P1.
+    pub p1_names: Vec<String>,
+    /// Dependency-lock file names that are never indexed.
+    pub dependency_files: Vec<String>,
+    /// Glob patterns upgrading matching files to P0 regardless of extension.
+    /// Matched (case-insensitively) against the root-relative POSIX path and
+    /// the bare file name; `*` does not cross `/`, use `**/`.
+    pub p0_globs: Vec<String>,
+    /// Glob patterns classifying matching files as P1 when nothing above did.
+    pub p1_globs: Vec<String>,
 }
 
 impl Default for IndexSettings {
@@ -47,8 +61,18 @@ impl Default for IndexSettings {
             chunk_overlap_chars: 160,
             auto_refresh: true,
             auto_refresh_interval_secs: 10,
+            p0_exts: list(P0_EXTS),
+            p1_exts: list(P1_EXTS),
+            p1_names: list(P1_NAMES),
+            dependency_files: list(DEPENDENCY_FILES),
+            p0_globs: Vec::new(),
+            p1_globs: Vec::new(),
         }
     }
+}
+
+fn list(names: &[&str]) -> Vec<String> {
+    names.iter().map(|s| s.to_string()).collect()
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -108,7 +132,10 @@ pub fn settings() -> &'static Settings {
 }
 
 pub fn write_default_config(path: &Path) -> std::io::Result<()> {
-    let template = "\
+    // Lists are written out in full so each entry is visible and editable;
+    // a list present in the file replaces the built-in default entirely.
+    let template = format!(
+        "\
 # rag configuration — environment variables (RAG_*) override these values.
 provider: lmstudio                # lmstudio | ollama | openai (OpenAI-compatible)
 # base_url: http://localhost:1234/v1
@@ -125,16 +152,37 @@ index:
   auto_refresh: true              # MCP server re-embeds changed files automatically
   auto_refresh_interval_secs: 10  # how often watched roots are scanned for changes
 
+  # Tier classification. A list present here replaces the default entirely;
+  # globs are matched (case-insensitive) against the root-relative path and
+  # the file name — `*` does not cross `/`, use `**/` for directories.
+  p0_exts: {p0_exts}
+  p1_exts: {p1_exts}
+  p1_names: {p1_names}
+  dependency_files: {dep_files}   # never indexed (lockfiles, dependency sums)
+  p0_globs: []                    # e.g. [\"**/migrations/**\", \"*.proto\"]
+  p1_globs: []                    # e.g. [\"**/*.csv\", \"**/fixtures/**\"]
+
 search:
   k: 5
   p1_damp: 0.9                    # score multiplier for P1 (non source/md) results
   hit_threshold: 0.3
   snippet_max_chars: 1600
-";
+",
+        p0_exts = yaml_list(&IndexSettings::default().p0_exts),
+        p1_exts = yaml_list(&IndexSettings::default().p1_exts),
+        p1_names = yaml_list(&IndexSettings::default().p1_names),
+        dep_files = yaml_list(&IndexSettings::default().dependency_files),
+    );
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, template)
+}
+
+/// One-line YAML flow list with entries quoted for safety.
+fn yaml_list(items: &[String]) -> String {
+    let inner: Vec<String> = items.iter().map(|s| format!("\"{s}\"")).collect();
+    format!("[{}]", inner.join(", "))
 }
 
 // ---------------------------------------------------------------------------
@@ -324,7 +372,8 @@ pub const P1_EXTS: &[&str] = &[
     "gitattributes", "editorconfig", "npmrc", "nvmrc", "csproj", "sln", "props", "targets",
 ];
 
-const P1_NAMES: &[&str] = &[
+/// P1 ("support"): whole file names always classified P1.
+pub const P1_NAMES: &[&str] = &[
     "dockerfile",
     "makefile",
     "license",
@@ -339,23 +388,76 @@ const P1_NAMES: &[&str] = &[
     ".nvmrc",
 ];
 
-/// Classify a file name into its processing tier; None means "not indexable".
-pub fn tier_for(filename: &str) -> Option<Tier> {
-    let lower = filename.to_ascii_lowercase();
-    if P1_NAMES.contains(&lower.as_str()) {
+/// Dependency-lock file names never worth embedding (anything named `*.lock`
+/// is already excluded by the tier lists; these have other extensions or none).
+pub const DEPENDENCY_FILES: &[&str] = &[
+    "cargo.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lock",
+    "npm-shrinkwrap.json",
+    "composer.lock",
+    "gemfile.lock",
+    "pipfile.lock",
+    "poetry.lock",
+    "uv.lock",
+    "pdm.lock",
+    "go.sum",
+    "packages.lock.json",
+    "flake.lock",
+];
+
+/// Classify a root-relative path into its processing tier; None means "not
+/// indexable". Order: P1 names → extensions (P0 then P1) → P0 globs → P1 globs.
+pub fn tier_for(rel_path: &str) -> Option<Tier> {
+    tier_for_in(&settings().index, rel_path)
+}
+
+/// Pure variant of [`tier_for`] for tests and callers holding settings.
+pub fn tier_for_in(idx: &IndexSettings, rel_path: &str) -> Option<Tier> {
+    let lower = rel_path.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    if idx.p1_names.iter().any(|n| n == name) {
         return Some(Tier::P1);
     }
-    let ext = lower
+    let ext = name
         .rsplit_once('.')
         .filter(|(stem, _)| !stem.is_empty())
-        .map(|(_, ext)| ext)?;
-    if P0_EXTS.contains(&ext) {
-        Some(Tier::P0)
-    } else if P1_EXTS.contains(&ext) {
-        Some(Tier::P1)
-    } else {
-        None
+        .map(|(_, ext)| ext);
+    if let Some(ext) = ext {
+        if idx.p0_exts.iter().any(|e| e == ext) {
+            return Some(Tier::P0);
+        }
+        if idx.p1_exts.iter().any(|e| e == ext) {
+            return Some(Tier::P1);
+        }
     }
+    if glob_matches(&idx.p0_globs, &lower, name) {
+        return Some(Tier::P0);
+    }
+    if glob_matches(&idx.p1_globs, &lower, name) {
+        return Some(Tier::P1);
+    }
+    None
+}
+
+/// A pattern hits when it matches the root-relative path or the bare file
+/// name (so `*.csv` reaches `sub/dir/x.csv` without a `**/` prefix).
+fn glob_matches(patterns: &[String], path: &str, name: &str) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+    let mut builder = globset::GlobSetBuilder::new();
+    for p in patterns {
+        if let Ok(glob) = globset::GlobBuilder::new(p).case_insensitive(true).build() {
+            builder.add(glob);
+        }
+    }
+    let Ok(set) = builder.build() else {
+        return false;
+    };
+    set.is_match(path) || set.is_match(name)
 }
 
 #[cfg(test)]
@@ -401,5 +503,63 @@ mod tests {
         assert_eq!(parsed.index.auto_refresh_interval_secs, 30);
         // Default settings keep auto-refresh on.
         assert!(Settings::default().index.auto_refresh);
+    }
+
+    #[test]
+    fn custom_lists_replace_defaults() {
+        let idx = IndexSettings { p0_exts: vec!["zig".into()], ..IndexSettings::default() };
+        assert_eq!(tier_for_in(&idx, "main.zig"), Some(Tier::P0));
+        // Defaults are gone once the list is replaced.
+        assert_eq!(tier_for_in(&idx, "main.rs"), None);
+        // Unrelated lists keep their defaults.
+        assert_eq!(tier_for_in(&idx, "package.json"), Some(Tier::P1));
+        assert_eq!(tier_for_in(&idx, "Dockerfile"), Some(Tier::P1));
+        assert_eq!(tier_for_in(&idx, "cargo.lock"), None);
+    }
+
+    #[test]
+    fn tier_globs() {
+        let idx = IndexSettings {
+            p0_globs: vec!["**/migrations/*.sql".into(), "*.proto".into()],
+            p1_globs: vec!["data/**".into()],
+            ..IndexSettings::default()
+        };
+        assert_eq!(tier_for_in(&idx, "db/migrations/003_init.sql"), Some(Tier::P0));
+        assert_eq!(tier_for_in(&idx, "schema.proto"), Some(Tier::P0));
+        // Bare-name matching: `*.proto` reaches nested files without `**/`.
+        assert_eq!(tier_for_in(&idx, "sub/dir/api.proto"), Some(Tier::P0));
+        assert_eq!(tier_for_in(&idx, "data/dump.csv"), Some(Tier::P1));
+        // Case-insensitive.
+        assert_eq!(tier_for_in(&idx, "Data/DUMP.CSV"), Some(Tier::P1));
+        // Globs only rescue otherwise-unclassified files; extension rules win.
+        assert_eq!(tier_for_in(&idx, "data/readme.md"), Some(Tier::P0));
+        assert_eq!(tier_for_in(&idx, "photo.jpg"), None);
+        assert_eq!(tier_for_in(&idx, "random.txt"), Some(Tier::P1));
+    }
+
+    #[test]
+    fn dependency_files_are_configurable() {
+        let mut idx = IndexSettings::default();
+        assert!(!idx.dependency_files.is_empty());
+        idx.dependency_files.clear();
+        // Clearing the list stops the exclusion at the classification layer
+        // (files::walk is what drops dependency files).
+        assert_eq!(tier_for_in(&idx, "pnpm-lock.yaml"), Some(Tier::P1));
+    }
+
+    #[test]
+    fn default_template_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("rag-config-tpl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        write_default_config(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let parsed: Settings = serde_yaml::from_str(&text).unwrap();
+        assert_eq!(parsed.index.p0_exts, IndexSettings::default().p0_exts);
+        assert_eq!(parsed.index.p1_names, IndexSettings::default().p1_names);
+        assert_eq!(parsed.index.dependency_files, IndexSettings::default().dependency_files);
+        assert!(parsed.index.p0_globs.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
