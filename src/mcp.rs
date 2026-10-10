@@ -1,3 +1,4 @@
+use crate::config;
 use crate::ops;
 use anyhow::Result;
 use rmcp::model::{
@@ -8,12 +9,17 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 const NAME: &str = "zcode-rag";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub struct RagServer;
+pub struct RagServer {
+    /// Roots indexed through this session — auto-refreshed in the background.
+    watched: Arc<Mutex<Vec<PathBuf>>>,
+}
 
 /// One flat args type: every tool's parameters are optional.
 #[derive(Deserialize, Default)]
@@ -47,14 +53,14 @@ struct ToolArgs {
 fn tool(
     name: &'static str,
     title: &str,
-    description: &'static str,
+    description: &str,
     properties: Value,
     required: &[&str],
 ) -> Tool {
     let mut t = Tool::default();
     t.name = name.into();
     t.title = Some(title.to_string());
-    t.description = Some(description.into());
+    t.description = Some(description.to_string().into());
     let schema = json!({ "type": "object", "properties": properties, "required": required });
     t.input_schema = Arc::new(schema.as_object().cloned().expect("object schema"));
     t
@@ -65,18 +71,21 @@ fn opt_path() -> Value {
 }
 
 fn tools() -> Vec<Tool> {
+    let refresh_secs = config::auto_refresh_interval_secs();
     vec![
         tool(
             "rag_status",
             "RAG status",
-            "Show RAG index status for a root folder: whether an index exists, LM Studio reachability, embedding model, file/chunk counts. Read-only and free.",
+            "Show RAG index status for a root folder: whether an index exists, LM Studio reachability, embedding model, file/chunk counts, and auto-refresh state. Read-only and free.",
             opt_path(),
             &[],
         ),
         tool(
             "rag_index",
-            "RAG index (manual)",
-            "Manually index (or incrementally refresh) files under a folder into the local RAG index using LM Studio embeddings. Manual by design: call this explicitly after meaningful changes. Unchanged files are skipped (cheap); P0 (source code + markdown) is embedded first, P1 follows. force:true rebuilds from scratch.",
+            "RAG index (initial / force rebuild)",
+            &format!(
+                "Index files under a folder into the local RAG index. Call once per root to build the initial index; afterwards the server re-embeds changed files automatically every {refresh_secs}s while a session is alive, so no need to call this for incremental updates. P0 (source code + markdown) is embedded first; unchanged files are skipped. force:true rebuilds from scratch."
+            ),
             json!({
                 "path": { "type": "string", "description": "Root folder to index (default: server cwd)" },
                 "force": { "type": "boolean", "description": "Rebuild the whole index from scratch" },
@@ -87,7 +96,7 @@ fn tools() -> Vec<Tool> {
         tool(
             "rag_search",
             "RAG search",
-            "Semantic search over manually indexed files (LM Studio embeddings). Cheaper than reading many files: returns only top-k relevant chunks with file:line references. P0 results outrank P1 (damped 0.9) unless no_boost.",
+            "Semantic search over indexed files (LM Studio embeddings). Cheaper than reading many files: returns only top-k relevant chunks with file:line references. P0 results outrank P1 (damped 0.9) unless no_boost.",
             json!({
                 "query": { "type": "string", "description": "Natural-language query (Portuguese or English)" },
                 "k": { "type": "integer", "description": "Max results (default 5)", "minimum": 1, "maximum": 20 },
@@ -144,12 +153,13 @@ impl ServerHandler for RagServer {
         let capabilities = ServerCapabilities::builder().enable_tools().build();
         let mut info = ServerInfo::new(capabilities);
         info.server_info = Implementation::new(NAME, VERSION);
-        info.instructions = Some(
-            "Manual RAG over local files with LM Studio embeddings. Call rag_index once per root, \
-             prefer rag_search before reading files, and rag_stats reports whether the index is \
-             paying off."
-                .into(),
-        );
+        info.instructions = Some(format!(
+            "Local RAG over files with LM Studio embeddings. Call rag_index once per root to \
+             build the initial index; afterwards changed files are re-embedded automatically \
+             every {}s while this session is alive. Prefer rag_search before reading files, and \
+             rag_stats reports whether the index is paying off.",
+            config::auto_refresh_interval_secs()
+        ));
         info
     }
 
@@ -174,17 +184,27 @@ impl ServerHandler for RagServer {
                 "rag_status" => ops::status(args.path.as_deref())
                     .await
                     .map_err(|e| format!("{e:#}")),
-                "rag_index" => ops::index(
-                    args.path.as_deref(),
-                    args.force.unwrap_or(false),
-                    args.dry_run.unwrap_or(false),
-                    args.batch_size,
-                    args.concurrency,
-                    args.no_ignore.unwrap_or(false),
-                    false, // progress auto-downgrades to plain over stdio pipes
-                )
-                .await
-                .map_err(|e| format!("{e:#}")),
+                "rag_index" => {
+                    let root = ops::resolve_root(args.path.as_deref());
+                    let dry_run = args.dry_run.unwrap_or(false);
+                    let outcome = ops::index(ops::IndexOpts {
+                        path: args.path.clone(),
+                        force: args.force.unwrap_or(false),
+                        dry_run,
+                        batch: args.batch_size,
+                        concurrency: args.concurrency,
+                        no_ignore: args.no_ignore.unwrap_or(false),
+                        quiet: false,
+                        no_progress: false, // auto-downgrades to plain over stdio pipes
+                    })
+                    .await
+                    .map_err(|e| format!("{e:#}"));
+                    // Roots indexed through this session join the auto-refresh watch list.
+                    if outcome.is_ok() && !dry_run {
+                        register_root(&self.watched, root).await;
+                    }
+                    outcome
+                }
                 "rag_search" => match args.query.as_deref() {
                     Some(query) => ops::search(
                         query,
@@ -204,7 +224,7 @@ impl ServerHandler for RagServer {
                 },
                 "rag_stats" => ops::stats(args.path.as_deref(), args.reset.unwrap_or(false))
                     .map_err(|e| format!("{e:#}")),
-                "rag_clear" => ops::clear(args.path.as_deref()).map_err(|e| format!("{e:#}")),
+                "rag_clear" => ops::clear(args.path.as_deref()).await.map_err(|e| format!("{e:#}")),
                 other => Err(format!("unknown tool: {other}")),
             },
         };
@@ -217,7 +237,16 @@ impl ServerHandler for RagServer {
 }
 
 pub async fn serve() -> i32 {
-    let service = RagServer;
+    let watched: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+    // Config is process-fixed (OnceLock), so the enabled check is final here.
+    if config::auto_refresh() {
+        tokio::spawn(auto_refresh_loop(watched.clone()));
+    } else {
+        eprintln!(
+            "[rag] auto-refresh disabled (index.auto_refresh / RAG_AUTO_REFRESH); indexes only update on explicit rag_index"
+        );
+    }
+    let service = RagServer { watched };
     match service.serve(rmcp::transport::stdio()).await {
         Ok(running) => {
             let _ = running.waiting().await;
@@ -227,5 +256,94 @@ pub async fn serve() -> i32 {
             eprintln!("rag mcp error: {err:#}");
             1
         }
+    }
+}
+
+async fn register_root(watched: &Arc<Mutex<Vec<PathBuf>>>, root: PathBuf) {
+    let root = std::fs::canonicalize(&root).unwrap_or(root);
+    let mut roots = watched.lock().await;
+    if !roots.contains(&root) {
+        roots.push(root);
+    }
+}
+
+/// Roots the current tick should consider: those indexed through this session
+/// plus the server cwd (its initial index may come from an earlier session or
+/// the CLI), canonicalized and deduplicated.
+async fn candidate_roots(watched: &Arc<Mutex<Vec<PathBuf>>>) -> Vec<PathBuf> {
+    let mut roots = watched.lock().await.clone();
+    roots.push(ops::resolve_root(None));
+    let mut seen = std::collections::HashSet::new();
+    roots
+        .into_iter()
+        .map(|r| std::fs::canonicalize(&r).unwrap_or(r))
+        .filter(|r| seen.insert(r.clone()))
+        .collect()
+}
+
+/// Display a path without the `\\?\` verbatim prefix canonicalize adds on
+/// Windows.
+fn display_path(p: &std::path::Path) -> std::borrow::Cow<'_, str> {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}").into();
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return rest.to_string().into();
+    }
+    s
+}
+
+/// Background incremental refresh: every interval, diff each watched root
+/// (stat-only) and re-embed only changed/new files. Idle ticks cost one
+/// directory walk and no network I/O. On embedding errors (e.g. LM Studio
+/// unloaded) it backs off exponentially up to 5 minutes and resets on the
+/// first success.
+async fn auto_refresh_loop(watched: Arc<Mutex<Vec<PathBuf>>>) {
+    let interval = config::auto_refresh_interval_secs();
+    let mut backoff = 0u64;
+    loop {
+        let wait = if backoff > 0 { backoff } else { interval };
+        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+        let mut failed = false;
+        for root in candidate_roots(&watched).await {
+            if !ops::index_exists(&root) {
+                continue; // the initial index stays manual
+            }
+            let started = std::time::Instant::now();
+            match ops::index_run(ops::IndexOpts {
+                path: Some(root.to_string_lossy().into_owned()),
+                quiet: true,
+                ..Default::default()
+            })
+            .await
+            {
+                Ok(outcome) if outcome.changed => {
+                    eprintln!(
+                        "[rag] auto-refresh: {} embedded, {} reused (content unchanged), {} removed — {} ({:.1}s)",
+                        outcome.embedded_files,
+                        outcome.reused_files,
+                        outcome.removed,
+                        display_path(&root),
+                        started.elapsed().as_secs_f32()
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!(
+                        "[rag] auto-refresh failed for {}: {e:#} — next attempt in {}s",
+                        display_path(&root),
+                        if backoff == 0 { interval * 2 } else { (backoff * 2).min(300) }
+                    );
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        backoff = if failed {
+            if backoff == 0 { interval * 2 } else { (backoff * 2).min(300) }
+        } else {
+            0
+        };
     }
 }

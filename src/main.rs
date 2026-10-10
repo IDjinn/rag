@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "rag",
     version,
-    about = "Local RAG for ZCode: manual indexing with LM Studio embeddings, SIMD search, cost/utility stats."
+    about = "Local RAG for ZCode: manual first index + automatic incremental refresh, LM Studio embeddings, SIMD search, cost/utility stats."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -24,7 +24,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Manual (incremental) indexing; unchanged files are skipped
+    /// Build the initial index (or refresh); afterwards `rag serve` keeps it
+    /// updated automatically. Unchanged files are skipped.
     Index {
         /// Root folder to index (default: current directory)
         path: Option<String>,
@@ -109,7 +110,19 @@ async fn run(command: Option<Command>) -> i32 {
     match command.unwrap_or(Command::Serve) {
         Command::Serve => return mcp::serve().await,
         Command::Index { path, force, dry_run, batch_size, concurrency, no_ignore, no_progress } => {
-            report(ops::index(path.as_deref(), force, dry_run, batch_size, concurrency, no_ignore, no_progress).await)
+            report(
+                ops::index(ops::IndexOpts {
+                    path,
+                    force,
+                    dry_run,
+                    batch: batch_size,
+                    concurrency,
+                    no_ignore,
+                    no_progress,
+                    quiet: false,
+                })
+                .await,
+            )
         }
         Command::Search { query, k, path, judge, no_boost } => {
             report(ops::search(&query, k, path.as_deref(), judge, no_boost).await)
@@ -117,7 +130,7 @@ async fn run(command: Option<Command>) -> i32 {
         Command::Config { init } => report(ops::config_cmd(init)),
         Command::Stats { path, reset } => report(ops::stats(path.as_deref(), reset)),
         Command::Status { path } => report(ops::status(path.as_deref()).await),
-        Command::Clear { path } => report(ops::clear(path.as_deref())),
+        Command::Clear { path } => report(ops::clear(path.as_deref()).await),
         Command::Feedback { json, path } => report(ops::feedback(&json, path.as_deref())),
     }
 }

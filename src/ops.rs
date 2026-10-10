@@ -10,8 +10,9 @@ use anyhow::{bail, Result};
 use memmap2::Mmap;
 use rayon::prelude::*;
 use serde::Deserialize;
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, MutexGuard, OnceLock};
 use std::time::Instant;
 
 pub fn resolve_root(path: Option<&str>) -> PathBuf {
@@ -43,39 +44,195 @@ fn est_chunks(size: u64) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Per-root locking
+// ---------------------------------------------------------------------------
+
+/// Locks guarding one index directory. `op` serializes whole index runs
+/// (manual tool calls vs the background auto-refresh) and is async because it
+/// is held across embedding requests. `store` guards the on-disk
+/// index.json/vectors.bin pair and stats.json against torn reads/writes, and
+/// is only ever held across short synchronous I/O — never across an await.
+struct RootLocks {
+    op: tokio::sync::Mutex<()>,
+    store: std::sync::Mutex<()>,
+}
+
+fn root_locks(root: &Path) -> Arc<RootLocks> {
+    static LOCKS: OnceLock<std::sync::Mutex<HashMap<PathBuf, Arc<RootLocks>>>> = OnceLock::new();
+    // Keyed by index directory so roots that map to the same index share locks.
+    let key = config::index_dir_for(root);
+    let map = LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .entry(key)
+        .or_insert_with(|| {
+            Arc::new(RootLocks {
+                op: tokio::sync::Mutex::new(()),
+                store: std::sync::Mutex::new(()),
+            })
+        })
+        .clone()
+}
+
+fn lock_store(locks: &RootLocks) -> MutexGuard<'_, ()> {
+    locks.store.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Whether a root already has an index on disk. The initial index stays
+/// manual; auto-refresh only maintains existing indexes.
+pub fn index_exists(root: &Path) -> bool {
+    Store::for_root(root).load().is_some()
+}
+
+/// Whether an incremental run has work to do: any indexed file changed on
+/// disk (mtime/size, mirroring the pass-1 skip condition), any new file, or
+/// any file gone since the last index. Pure stat-level check — no reads.
+fn has_changes(old: &IndexData, all_files: &[DiscoveredFile], old_dim: usize) -> bool {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::with_capacity(all_files.len());
+    for f in all_files {
+        seen.insert(f.rel.as_str());
+        let unchanged = old
+            .files
+            .get(&f.rel)
+            .is_some_and(|e| files::same_state((e.mtime_ms, e.size), (f.mtime_ms, f.size)) && old_dim > 0);
+        if !unchanged {
+            return true;
+        }
+    }
+    old.files.keys().any(|k| !seen.contains(k.as_str()))
+}
+
+/// Chunk rows of a file that actually fit in the vectors blob. Guards the
+/// scoring loop against a mismatched index.json/vectors.bin pair (possible
+/// with cross-process writes); with panic=abort any slice panic is fatal.
+fn visible_chunks(base: usize, chunk_count: usize, dim: usize, rows_len: usize) -> usize {
+    if dim == 0 {
+        return 0;
+    }
+    let avail = rows_len.saturating_sub(base) / dim;
+    chunk_count.min(avail)
+}
+
+// ---------------------------------------------------------------------------
 // rag_index
 // ---------------------------------------------------------------------------
 
-pub async fn index(
-    path: Option<&str>,
-    force: bool,
-    dry_run: bool,
-    batch: Option<usize>,
-    concurrency: Option<usize>,
-    no_ignore: bool,
-    no_progress: bool,
-) -> Result<String> {
+/// Options for one `rag index` run.
+pub struct IndexOpts {
+    pub path: Option<String>,
+    /// Rebuild from scratch, re-embedding everything.
+    pub force: bool,
+    /// Report per-tier estimates without embedding or writing.
+    pub dry_run: bool,
+    pub batch: Option<usize>,
+    pub concurrency: Option<usize>,
+    /// Ignore .gitignore/.ignore rules.
+    pub no_ignore: bool,
+    /// Plain non-interactive progress output.
+    pub no_progress: bool,
+    /// Fully silent progress (background auto-refresh ticks).
+    pub quiet: bool,
+}
+
+impl Default for IndexOpts {
+    fn default() -> Self {
+        Self {
+            path: None,
+            force: false,
+            dry_run: false,
+            batch: None,
+            concurrency: None,
+            no_ignore: false,
+            no_progress: false,
+            quiet: false,
+        }
+    }
+}
+
+/// What a completed run did; the auto-refresh loop logs a summary line only
+/// when `changed` is set.
+pub struct IndexOutcome {
+    pub report: String,
+    pub changed: bool,
+    pub embedded_files: u64,
+    /// Files whose mtime/size changed but content matched — re-embedded nothing.
+    pub reused_files: u64,
+    pub removed: u64,
+}
+
+pub async fn index(opts: IndexOpts) -> Result<String> {
+    index_run(opts).await.map(|o| o.report)
+}
+
+pub(crate) async fn index_run(opts: IndexOpts) -> Result<IndexOutcome> {
+    let IndexOpts { path, force, dry_run, batch, concurrency, no_ignore, no_progress, quiet } = opts;
     let batch = batch.unwrap_or(config::settings().index.batch_size);
     let concurrency = concurrency.unwrap_or(config::settings().index.concurrency);
     let started = Instant::now();
-    let root = resolve_root(path);
+    let root = resolve_root(path.as_deref());
     if !root.is_dir() {
         bail!("path is not a directory: {}", root.display());
     }
     let root_str = root.to_string_lossy().replace('\\', "/");
     let all_files = files::walk(&root, !no_ignore);
     if all_files.is_empty() {
-        return Ok(format!("No indexable files found under `{}`.", root_str));
+        return Ok(IndexOutcome {
+            report: format!("No indexable files found under `{root_str}`."),
+            changed: false,
+            embedded_files: 0,
+            reused_files: 0,
+            removed: 0,
+        });
     }
 
     if dry_run {
-        return dry_run_report(&root_str, &all_files, batch, concurrency);
+        return Ok(IndexOutcome {
+            report: dry_run_report(&root_str, &all_files, batch, concurrency)?,
+            changed: false,
+            embedded_files: 0,
+            reused_files: 0,
+            removed: 0,
+        });
+    }
+
+    let prog = if quiet { Progress::silent() } else { Progress::new(no_progress) };
+
+    let store = Store::for_root(&root);
+    // One index run per root at a time: a manual tool call and the background
+    // auto-refresh both rebuild from the previous index's vectors, so
+    // overlapping runs would embed from stale state.
+    let locks = root_locks(&root);
+    let _op_guard = locks.op.lock().await;
+
+    let old = store.load().filter(|_| !force);
+    let old_dim = old.as_ref().map_or(0, |d| d.dim);
+
+    // Up-to-date fast path before any network I/O: idle auto-refresh ticks
+    // must not touch LM Studio or rewrite vectors.bin.
+    if old.as_ref().is_some_and(|o| !has_changes(o, &all_files, old_dim)) {
+        prog.finish();
+        return Ok(IndexOutcome {
+            report: format!(
+                "## rag index — up to date\n\n\
+                 - **Root:** {root_str}\n\
+                 - Nothing changed since the last index ({} file(s) checked). No embeddings, nothing written.",
+                all_files.len()
+            ),
+            changed: false,
+            embedded_files: 0,
+            reused_files: 0,
+            removed: 0,
+        });
     }
 
     let client = LmClient::new()?;
     let model = client.resolve_embed_model().await?;
-    let store = Store::for_root(&root);
-    let old = store.load().filter(|_| !force);
+    prog.header(&format!(
+        "Indexing {root_str} · {} · model `{model}` · {} file(s){}",
+        config::provider_name(),
+        all_files.len(),
+        if force { " · force rebuild" } else { "" },
+    ));
     if let Some(old_data) = &old {
         let different_model = old_data.model != model || old_data.provider != config::provider_name();
         if different_model && old_data.vector_count > 0 {
@@ -88,7 +245,6 @@ pub async fn index(
         }
     }
     let old_mmap = old.as_ref().and_then(|_| store.mmap_vectors());
-    let old_dim = old.as_ref().map_or(0, |d| d.dim);
     let removed = old
         .as_ref()
         .map(|o| {
@@ -113,14 +269,6 @@ pub async fn index(
     let mut counters = EmbedCounters::default();
     let mut rows_since_checkpoint = 0usize;
     let mut last_index_ms = 0u64;
-
-    let prog = Progress::new(no_progress);
-    prog.header(&format!(
-        "Indexing {root_str} · {} · model `{model}` · {} file(s){}",
-        config::provider_name(),
-        all_files.len(),
-        if force { " · force rebuild" } else { "" },
-    ));
 
     // Pass 1 (both tiers upfront): unchanged files are copied straight over,
     // so the embedding totals below are exact file counts and close estimates
@@ -189,6 +337,7 @@ pub async fn index(
                 prog.window_done(chunk_base);
                 rows_since_checkpoint += window_est * data.dim.max(1);
                 if rows_since_checkpoint > 25_000 {
+                    let _store_guard = lock_store(&locks);
                     store.save(&data, &vectors)?; // checkpoint: crash keeps committed work
                     rows_since_checkpoint = 0;
                 }
@@ -211,28 +360,34 @@ pub async fn index(
 
     data.vector_count = if data.dim > 0 { vectors.len() / data.dim } else { 0 };
     data.updated_at = store::now_iso();
-    store.save(&data, &vectors)?;
+    {
+        let _store_guard = lock_store(&locks);
+        store.save(&data, &vectors)?;
+    }
     prog.finish();
 
-    let mut s = stats::load(&store.dir);
-    s.index_runs += 1;
-    s.last_indexed_at = Some(data.updated_at.clone());
-    s.last_index_ms = Some(last_index_ms);
-    s.files_indexed += counters.embedded_files;
-    s.files_skipped += counters.skipped;
-    s.files_removed += removed;
-    s.chunks_embedded += counters.embedded_chunks;
-    s.embed_requests += counters.requests;
-    s.embed_tokens += counters.tokens;
-    s.embed_ms += counters.embed_ms;
-    s.p0_files = data.files.values().filter(|e| e.tier == Tier::P0).count() as u64;
-    s.p1_files = data.files.values().filter(|e| e.tier == Tier::P1).count() as u64;
-    stats::save(&store.dir, &s);
+    {
+        let _store_guard = lock_store(&locks);
+        let mut s = stats::load(&store.dir);
+        s.index_runs += 1;
+        s.last_indexed_at = Some(data.updated_at.clone());
+        s.last_index_ms = Some(last_index_ms);
+        s.files_indexed += counters.embedded_files;
+        s.files_skipped += counters.skipped;
+        s.files_removed += removed;
+        s.chunks_embedded += counters.embedded_chunks;
+        s.embed_requests += counters.requests;
+        s.embed_tokens += counters.tokens;
+        s.embed_ms += counters.embed_ms;
+        s.p0_files = data.files.values().filter(|e| e.tier == Tier::P0).count() as u64;
+        s.p1_files = data.files.values().filter(|e| e.tier == Tier::P1).count() as u64;
+        stats::save(&store.dir, &s);
+    }
 
     let wall = started.elapsed().as_millis() as u64;
     let p0 = data.files.values().filter(|e| e.tier == Tier::P0).count();
     let p1 = data.files.len() - p0;
-    Ok(format!(
+    let report = format!(
         "## rag index complete\n\n\
          - **Root:** {root_str}\n\
          - **Provider:** {} — **Model:** {model} (dim {})\n\
@@ -240,8 +395,8 @@ pub async fn index(
          - **Chunks embedded:** {} (~{} tokens, {} request(s), {:.1}s)\n\
          - **Total vectors:** {} | index size: {:.0} KB\n\
          - **Wall time:** {:.1}s\n\n\
-         Indexing is manual by design. Re-run `rag index` after meaningful changes — \
-         unchanged files are copied over without embeddings.",
+         This root now refreshes automatically every {}s while a `rag serve` session is alive; \
+         re-run manually only to force a full rebuild.",
         config::provider_name(),
         data.dim,
         data.files.len(),
@@ -254,7 +409,15 @@ pub async fn index(
         data.vector_count,
         store.disk_bytes() as f64 / 1024.0,
         wall as f64 / 1000.0,
-    ))
+        config::auto_refresh_interval_secs(),
+    );
+    Ok(IndexOutcome {
+        report,
+        changed: true,
+        embedded_files: counters.embedded_files,
+        reused_files: counters.reused,
+        removed,
+    })
 }
 
 #[derive(Default)]
@@ -318,6 +481,10 @@ async fn embed_and_commit(
                 }
                 let mut e = entry.clone();
                 e.vec_offset = data.vector_count;
+                // Refresh the stat-level state: otherwise a touched-but-unchanged
+                // file stays "pending" in every later run (mtime churn).
+                e.mtime_ms = f.mtime_ms;
+                e.size = f.size;
                 data.vector_count += e.chunk_count;
                 data.files.insert(f.rel.to_string(), e);
                 counters.reused += 1;
@@ -445,9 +612,23 @@ pub async fn search(query: &str, k: Option<usize>, path: Option<&str>, judge: bo
     let started = Instant::now();
     let root = resolve_root(path);
     let store = Store::for_root(&root);
-    let Some(data) = store.load() else {
+    let locks = root_locks(&root);
+    // Load the index.json + vectors.bin pair under the store lock: the two
+    // renames in Store::save are not atomic as a pair, so an unlocked reader
+    // could see new metadata over old vectors. The mmap keeps the old
+    // snapshot valid after the lock is released.
+    let (data, mmap) = {
+        let _store_guard = lock_store(&locks);
+        let data = store.load();
+        let mmap = data
+            .as_ref()
+            .filter(|d| d.dim > 0 && d.vector_count > 0)
+            .and_then(|_| store.mmap_vectors());
+        (data, mmap)
+    };
+    let Some(data) = data else {
         return Ok(format!(
-            "No index found for `{}`. Run `rag index` first (indexing is manual by default).",
+            "No index found for `{}`. Run `rag index` once to build it (afterwards changes refresh automatically while a session is alive).",
             root.display()
         ));
     };
@@ -466,7 +647,7 @@ pub async fn search(query: &str, k: Option<usize>, path: Option<&str>, judge: bo
     q.truncate(data.dim);
     simd::l2_normalize(&mut q);
 
-    let Some(mmap) = store.mmap_vectors() else {
+    let Some(mmap) = mmap else {
         return Ok("Index vectors are missing; re-run `rag index`.".to_string());
     };
     let rows = vectors_as_slice(&mmap);
@@ -479,8 +660,9 @@ pub async fn search(query: &str, k: Option<usize>, path: Option<&str>, judge: bo
         .enumerate()
         .flat_map_iter(|(fi, (_, entry))| {
             let damp = if entry.tier == Tier::P1 && !no_boost { config::settings().search.p1_damp } else { 1.0 };
-            let base = entry.vec_offset * dim;
-            (0..entry.chunk_count).map(move |c| {
+            let base = entry.vec_offset.saturating_mul(dim);
+            let count = visible_chunks(base, entry.chunk_count, dim, rows.len());
+            (0..count).map(move |c| {
                 let off = base + c * dim;
                 (simd::dot(&rows[off..off + dim], q_ref) * damp, fi as u32, c as u32)
             })
@@ -558,28 +740,31 @@ pub async fn search(query: &str, k: Option<usize>, path: Option<&str>, judge: bo
     let full = est_tokens(full_file_chars);
     let top_score = scored.first().map_or(0.0, |(s, _, _)| *s);
 
-    let mut s = stats::load(&store.dir);
-    s.searches += 1;
-    s.search_results += scored.len() as u64;
-    if top_score >= config::settings().search.hit_threshold {
-        s.search_hits += 1;
+    {
+        let _store_guard = lock_store(&locks);
+        let mut s = stats::load(&store.dir);
+        s.searches += 1;
+        s.search_results += scored.len() as u64;
+        if top_score >= config::settings().search.hit_threshold {
+            s.search_hits += 1;
+        }
+        s.search_ms += elapsed;
+        s.context_tokens_delivered += delivered;
+        s.full_file_tokens_avoided += full;
+        stats::push_history(
+            &mut s,
+            QueryRecord {
+                ts: store::now_iso(),
+                query: query.to_string(),
+                results: scored.len(),
+                top_score,
+                ms: elapsed,
+                judged_count: Some(0),
+                useful_count: Some(0),
+            },
+        );
+        stats::save(&store.dir, &s);
     }
-    s.search_ms += elapsed;
-    s.context_tokens_delivered += delivered;
-    s.full_file_tokens_avoided += full;
-    stats::push_history(
-        &mut s,
-        QueryRecord {
-            ts: store::now_iso(),
-            query: query.to_string(),
-            results: scored.len(),
-            top_score,
-            ms: elapsed,
-            judged_count: Some(0),
-            useful_count: Some(0),
-        },
-    );
-    stats::save(&store.dir, &s);
 
     out.push_str(&format!(
         "---\n\n~{} tokens added to context (reading the {} matched file(s) fully would cost ~{} tokens). Search took {elapsed} ms.\n",
@@ -636,7 +821,10 @@ pub fn feedback_verdicts(verdicts: Vec<FeedbackVerdict>, path: Option<&str>) -> 
     if verdicts.is_empty() {
         return Ok("No verdicts provided.".to_string());
     }
-    let store = Store::for_root(&resolve_root(path));
+    let root = resolve_root(path);
+    let store = Store::for_root(&root);
+    let locks = root_locks(&root);
+    let _store_guard = lock_store(&locks);
     let mut s = stats::load(&store.dir);
     let Some(rec) = s.history.get_mut(0) else {
         return Ok("No recent search to attach verdicts to. Run rag_search first.".to_string());
@@ -661,8 +849,10 @@ pub fn feedback_verdicts(verdicts: Vec<FeedbackVerdict>, path: Option<&str>) -> 
 pub fn stats(root_path: Option<&str>, reset: bool) -> Result<String> {
     let root = resolve_root(root_path);
     let store = Store::for_root(&root);
+    let locks = root_locks(&root);
     let mut s = stats::load(&store.dir);
     if reset {
+        let _store_guard = lock_store(&locks);
         s = RagStats::default();
         stats::save(&store.dir, &s);
     }
@@ -699,7 +889,7 @@ pub fn stats(root_path: Option<&str>, reset: bool) -> Result<String> {
                 d.updated_at
             ));
         }
-        None => out.push_str("- No index yet. Run `rag index` (manual by default).\n\n"),
+        None => out.push_str("- No index yet. Run `rag index` once (afterwards changes refresh automatically).\n\n"),
     }
 
     out.push_str("### Cost (local: time + tokens embedded)\n\n");
@@ -809,14 +999,30 @@ pub async fn status(path: Option<&str>) -> Result<String> {
             out.push_str(&format!("- **Last indexed:** {}\n", d.updated_at));
             out.push_str(&format!("- **Disk:** {:.0} KB\n", store.disk_bytes() as f64 / 1024.0));
         }
-        None => out.push_str("- **Index:** none yet — run `rag index` (manual by default).\n"),
+        None => out.push_str("- **Index:** none yet — run `rag index` once; afterwards changed files refresh automatically.\n"),
     }
+    let refresh = if config::auto_refresh() {
+        format!("on (every {}s)", config::auto_refresh_interval_secs())
+    } else {
+        "off".to_string()
+    };
+    out.push_str(&format!(
+        "- **Auto-refresh:** {refresh} — the MCP server re-embeds changed files in watched roots (server cwd + roots indexed this session)\n"
+    ));
     Ok(out)
 }
 
-pub fn clear(path: Option<&str>) -> Result<String> {
-    let store = Store::for_root(&resolve_root(path));
-    Ok(if store.remove() {
+pub async fn clear(path: Option<&str>) -> Result<String> {
+    let root = resolve_root(path);
+    let store = Store::for_root(&root);
+    let locks = root_locks(&root);
+    // Wait out any in-flight index run, then remove without a save racing us.
+    let _op_guard = locks.op.lock().await;
+    let removed = {
+        let _store_guard = lock_store(&locks);
+        store.remove()
+    };
+    Ok(if removed {
         format!("Index and stats for root deleted ({}).", store.dir.display())
     } else {
         format!("No index found ({}).", store.dir.display())
@@ -848,4 +1054,99 @@ pub fn config_cmd(init: bool) -> Result<String> {
     );
     out.push_str(&serde_yaml::to_string(s)?);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::ChunkRef;
+
+    fn disc(rel: &str, size: u64, mtime_ms: i64) -> DiscoveredFile {
+        DiscoveredFile {
+            abs: PathBuf::from(rel),
+            rel: rel.to_string(),
+            size,
+            mtime_ms,
+            tier: Tier::P0,
+        }
+    }
+
+    fn entry(size: u64, mtime_ms: i64) -> FileEntry {
+        FileEntry {
+            hash: "h".into(),
+            size,
+            mtime_ms,
+            chunk_count: 1,
+            vec_offset: 0,
+            chunks: vec![ChunkRef { start: 1, end: 2 }],
+            tier: Tier::P0,
+        }
+    }
+
+    fn index_with(files: &[(&str, FileEntry)]) -> IndexData {
+        let mut data = IndexData::empty("root", "m");
+        data.dim = 4;
+        for (rel, e) in files {
+            data.files.insert(rel.to_string(), e.clone());
+        }
+        data
+    }
+
+    #[test]
+    fn has_changes_detects_diff_size_mtime_new_and_removed() {
+        let old = index_with(&[("a.rs", entry(10, 100)), ("b.rs", entry(20, 200))]);
+
+        // Identical state (within the 2ms mtime tolerance): no changes.
+        let same = vec![disc("a.rs", 10, 100), disc("b.rs", 20, 201)];
+        assert!(!has_changes(&old, &same, 4));
+
+        // Size changed.
+        let resized = vec![disc("a.rs", 11, 100), disc("b.rs", 20, 200)];
+        assert!(has_changes(&old, &resized, 4));
+
+        // mtime moved beyond tolerance.
+        let touched = vec![disc("a.rs", 10, 150), disc("b.rs", 20, 200)];
+        assert!(has_changes(&old, &touched, 4));
+
+        // New file on disk.
+        let added = vec![disc("a.rs", 10, 100), disc("b.rs", 20, 200), disc("c.rs", 5, 5)];
+        assert!(has_changes(&old, &added, 4));
+
+        // File removed from disk.
+        let gone = vec![disc("a.rs", 10, 100)];
+        assert!(has_changes(&old, &gone, 4));
+    }
+
+    #[test]
+    fn has_changes_forces_work_when_dim_is_zero() {
+        let mut old = index_with(&[("a.rs", entry(10, 100))]);
+        old.dim = 0; // unusable vectors: everything must be re-embedded
+        let same = vec![disc("a.rs", 10, 100)];
+        assert!(has_changes(&old, &same, 0));
+    }
+
+    #[test]
+    fn visible_chunks_clamps_to_blob() {
+        // 8 f32 rows, dim 4 → 2 chunks fit at base 0.
+        assert_eq!(visible_chunks(0, 3, 4, 8), 2);
+        // Starting past the blob yields nothing.
+        assert_eq!(visible_chunks(8, 2, 4, 8), 0);
+        assert_eq!(visible_chunks(100, 2, 4, 8), 0);
+        // Fully contained.
+        assert_eq!(visible_chunks(4, 1, 4, 8), 1);
+        // Guard rails.
+        assert_eq!(visible_chunks(0, 2, 0, 8), 0);
+    }
+
+    #[test]
+    fn root_locks_share_one_entry_per_root() {
+        let a = root_locks(Path::new("C:/some/root"));
+        let b = root_locks(Path::new("C:/some/root"));
+        let c = root_locks(Path::new("C:/other/root"));
+        assert!(Arc::ptr_eq(&a, &b));
+        assert!(!Arc::ptr_eq(&a, &c));
+        // The store lock must be usable (poison-free) and relockable.
+        drop(lock_store(&a));
+        drop(lock_store(&a));
+    }
 }

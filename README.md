@@ -7,10 +7,13 @@ statistics so you can tell whether it is paying off.
 - **Multi-provider embeddings** — anything speaking the OpenAI-compatible
   `/v1/embeddings` protocol: **LM Studio** (default), **Ollama**, or **OpenAI**
   / other clouds via `RAG_PROVIDER` + `RAG_API_KEY`.
-- **Manual by design** — indexing only happens when you run `rag index`.
-  Incremental: unchanged files are copied over without embeddings, so
-  refreshes are cheap. Checkpoints every few thousand chunks keep work across
-  crashes.
+- **Automatic incremental refresh** — the first `rag index` per root is
+  manual; afterwards the MCP server re-embeds changed/new files and drops
+  removed ones by itself (stat-only diff every `auto_refresh_interval_secs`,
+  default 10s; idle ticks do no network I/O and write nothing). Disable with
+  `index.auto_refresh: false` or `RAG_AUTO_REFRESH=0`. Incremental runs only
+  embed changed files, and checkpoints every few thousand chunks keep work
+  across crashes.
 - **Interactive progress** — `rag index` shows live bars on a terminal
   (files + ETA, chunks, current file, tokens); under pipes/CI or with
   `--no-progress` it falls back to plain one-line reports on stderr.
@@ -45,6 +48,30 @@ As an MCP server it exposes `rag_status`, `rag_index`, `rag_search`,
 returns a ready-to-run `jev_triage` payload; feed the verdicts back through
 `rag_feedback` and `rag_stats` reports the judged usefulness rate.
 
+## Auto-refresh
+
+The first index of a root is manual (`rag index` or the `rag_index` tool).
+After that, `rag serve` keeps it current on its own:
+
+- **Watched roots** — the server's cwd (its initial index may come from an
+  earlier session or the CLI) plus every root indexed through a `rag_index`
+  tool call in the current session. Roots without an index are ignored: the
+  initial index is never created automatically.
+- **Each tick** — a stat-only walk (mtime/size, the same ignore rules as
+  indexing) diffs the root against the index. Changed/new files are content-
+  hashed and re-embedded only if the hash differs; removed files are dropped.
+  An idle tick costs one directory walk, zero network requests and writes
+  nothing to disk. Searches never wait for a refresh (per-root locks keep the
+  `index.json`/`vectors.bin` pair consistent).
+- **Errors** — if the embedding server is down or unloaded, the loop logs one
+  stderr line and backs off exponentially (up to 5 minutes), resetting on the
+  first success. Search results still flag `⚠️ changed since indexing` in the
+  meantime.
+- **Limitations** — refresh lives with the session (no daemon once the server
+  exits), and a `rag index` run from a separate process while the server is
+  refreshing the same root is still last-writer-wins (no cross-process file
+  lock). Config changes (interval, on/off) require a server restart.
+
 ## Providers (env)
 
 | Variable | Default | Purpose |
@@ -55,6 +82,8 @@ returns a ready-to-run `jev_triage` payload; feed the verdicts back through
 | `RAG_API_KEY` | — | Bearer token for cloud providers |
 | `RAG_PRICE_PER_1M_TOKENS` | — | USD price for the cost report |
 | `RAG_DATA_DIR` | `~/.zcode/ia` | Index/stat storage root |
+| `RAG_AUTO_REFRESH` | `1` | `0`/`false` disables background auto-refresh |
+| `RAG_AUTO_REFRESH_SECS` | `10` | Auto-refresh scan interval (min 1s) |
 
 LM Studio notes: keep at least one **embedding-classified** model loaded (e.g.
 `text-embedding-nomic-embed-text-v1.5`) — models classified as LLM (such as
@@ -92,7 +121,8 @@ Restart the session (or Settings → MCP) after changing the file.
   parallel small ones. Your machine may differ; `rag index --dry-run` plus a
   timed run will tell.
 - Incremental re-index only embeds changed files; a killed run keeps committed
-  windows (checkpoint every ~25k vectors).
+  windows (checkpoint every ~25k vectors), and an incremental run that finds
+  nothing to do writes nothing at all (the auto-refresh idle path).
 
 ## Configuration file
 
@@ -108,6 +138,8 @@ embed_model: qwen.qwen3-vl-embedding-2b
 index:
   batch_size: 128
   concurrency: 1
+  auto_refresh: true              # MCP server re-embeds changed files automatically
+  auto_refresh_interval_secs: 10  # how often watched roots are scanned
 search:
   k: 5
   p1_damp: 0.9
