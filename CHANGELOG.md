@@ -4,6 +4,22 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.2.1 — 2026-10-10
+
+### Changed
+
+- **Hook now covers subagent delegation.** Real-world sessions showed the
+  SessionStart note alone doesn't stop exploration subagents from running
+  in parallel with (or instead of) the index: subagents start fresh without
+  the hook context, and Explore agents have no MCP tool access at all.
+  - The `SessionStart` message now defines the flow explicitly —
+    `rag_search` first, paste relevant file:line hits into subagent prompts,
+    fall back to Grep only for exact-string/regex sweeps and to subagents
+    only for what the index doesn't cover.
+  - New `PreToolUse` handler (register with matcher `Agent|Task`): emits a
+    short reminder at the exact moment the model spawns a subagent. Still
+    strictly advisory — nothing is blocked.
+
 ## 0.2.0 — 2026-10-10
 
 ### Added
