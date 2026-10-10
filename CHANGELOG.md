@@ -4,6 +4,26 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.2.2 — 2026-10-10
+
+### Changed
+
+- **Bare `rag` prints help** instead of silently starting the MCP stdio
+  server (which just sat in the terminal reading stdin). Launch the server
+  explicitly with `rag serve` — the documented ZCode registration already
+  passes it.
+- **Terminal-friendly CLI reports** — when stdout is a terminal, command
+  reports (stats, status, index, search, …) render as aligned plain text:
+  underlined headings, fixed-width tables with the markdown separator rows
+  dropped, inline `**`/backtick markers stripped. Piped/redirected output and
+  the MCP tools keep the markdown format.
+
+### Fixed
+
+- `rag stats` in a terminal no longer prints raw markdown tables
+  (`| when | query | …`), including the Recent queries table shown after
+  judged searches.
+
 ## 0.2.1 — 2026-10-10
 
 ### Changed
