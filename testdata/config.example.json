@@ -1,0 +1,17 @@
+{
+  "embedding": {
+    "providers": ["lmstudio", "ollama", "openai"],
+    "baseUrl": "http://localhost:1234/v1",
+    "model": "text-embedding-nomic-embed-text-v1.5"
+  },
+  "indexing": {
+    "mode": "manual",
+    "priority": { "p0": "source+markdown", "p1": "damped-0.9" },
+    "maxFileKb": 512,
+    "chunkTargetChars": 1100
+  },
+  "stats": {
+    "trackTokens": true,
+    "judgeWithJev": true
+  }
+}

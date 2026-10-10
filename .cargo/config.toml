@@ -1,0 +1,3 @@
+# Single-machine binary: tune codegen for this host (x86_64, AVX2-era).
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=native"]

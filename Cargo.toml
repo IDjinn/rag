@@ -1,0 +1,29 @@
+[package]
+name = "rag"
+version = "0.1.0"
+edition = "2021"
+description = "Local RAG for ZCode: manual file indexing with LM Studio embeddings, SIMD search, cost/utility stats."
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "time", "fs"] }
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+ignore = "0.4"
+rayon = "1"
+sha1 = "0.10"
+dirs = "5"
+anyhow = "1"
+wide = "0.7"
+memmap2 = "0.9"
+futures = "0.3"
+hex = "0.4"
+rmcp = { version = "3.5.1", features = ["server", "transport-io"] }
+serde_yaml = "0.9"
+indicatif = "0.17"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
