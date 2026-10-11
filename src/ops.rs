@@ -385,6 +385,15 @@ pub(crate) async fn index_run(opts: IndexOpts) -> Result<IndexOutcome> {
     }
 
     let wall = started.elapsed().as_millis() as u64;
+    let embed_rate = if counters.embed_ms > 0 {
+        format!(
+            "{:.0} chunks/s · {:.0} tok/s",
+            counters.embedded_chunks as f64 / (counters.embed_ms as f64 / 1000.0),
+            counters.tokens as f64 / (counters.embed_ms as f64 / 1000.0)
+        )
+    } else {
+        "n/a".to_string()
+    };
     let p0 = data.files.values().filter(|e| e.tier == Tier::P0).count();
     let p1 = data.files.len() - p0;
     let report = format!(
@@ -392,7 +401,7 @@ pub(crate) async fn index_run(opts: IndexOpts) -> Result<IndexOutcome> {
          - **Root:** {root_str}\n\
          - **Provider:** {} — **Model:** {model} (dim {})\n\
          - **Files in index:** {} (P0: {p0}, P1: {p1}) — {} embedded, {} unchanged, {removed} removed\n\
-         - **Chunks embedded:** {} (~{} tokens, {} request(s), {:.1}s)\n\
+         - **Chunks embedded:** {} (~{} tokens, {} request(s), {:.1}s, {embed_rate})\n\
          - **Total vectors:** {} | index size: {:.0} KB\n\
          - **Wall time:** {:.1}s\n\n\
          This root now refreshes automatically every {}s while a `rag serve` session is alive; \

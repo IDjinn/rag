@@ -2,7 +2,7 @@ use crate::config::Tier;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Progress reporting for `rag index`: two live bars on an interactive
 /// terminal (files + chunks, current file and tokens), or plain one-line
@@ -17,13 +17,22 @@ pub struct Progress {
 struct Live {
     multi: MultiProgress,
     /// Created by `begin()`; headers may print before any bar exists.
-    bars: Mutex<Option<Bars>>,
+    yarn: Mutex<Option<Yarn>>,
     tokens: AtomicU64,
 }
 
-struct Bars {
-    files: ProgressBar,
-    chunks: ProgressBar,
+/// Yarn-style UI: one persistent header spinner (`➤ ⠙ rag index …`) plus one
+/// spinner line per file being embedded, finished with `✔ <file>` when done.
+struct Yarn {
+    header: ProgressBar,
+    tier: String,
+    total_files: u64,
+    total_chunks: u64,
+    files_done: u64,
+    active: Option<ProgressBar>,
+    active_name: String,
+    /// Anchor for the live tok/s and chunks/s rates.
+    started: Instant,
 }
 
 struct Plain {
@@ -31,23 +40,34 @@ struct Plain {
     total: u64,
     tokens: u64,
     batches: u32,
+    started: Instant,
+}
+
+/// Human-readable rate, e.g. `1.2k tok/s`; `0 tok/s` before any time passes.
+fn rate(n: u64, elapsed: Duration) -> String {
+    let secs = elapsed.as_secs_f64();
+    if secs < 0.05 {
+        return "—".to_string();
+    }
+    let per_sec = n as f64 / secs;
+    if per_sec >= 1000.0 {
+        format!("{:.1}k", per_sec / 1000.0)
+    } else {
+        format!("{per_sec:.0}")
+    }
 }
 
 const TICKS: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
 
 fn files_style() -> ProgressStyle {
-    ProgressStyle::with_template(
-        "{spinner:.green} {msg} {wide_bar:.cyan/blue} {pos}/{len} files ({percent}%) ETA {eta}",
-    )
-    .expect("files progress template must parse")
-    .progress_chars("━╸─")
-    .tick_chars(TICKS)
+    ProgressStyle::with_template("➤ {spinner:.green} {msg}")
+        .expect("header spinner template must parse")
+        .tick_chars(TICKS)
 }
 
-fn chunks_style() -> ProgressStyle {
-    ProgressStyle::with_template("{spinner:.green} {wide_bar:.cyan/blue} {pos}/{len} chunks · {msg}")
-        .expect("chunks progress template must parse")
-        .progress_chars("━╸─")
+fn file_style() -> ProgressStyle {
+    ProgressStyle::with_template("  {spinner:.green} {msg}")
+        .expect("file spinner template must parse")
         .tick_chars(TICKS)
 }
 
@@ -63,7 +83,7 @@ impl Progress {
         Progress {
             live,
             silent: false,
-            plain: Mutex::new(Plain { phase: "", total: 0, tokens: 0, batches: 0 }),
+            plain: Mutex::new(Plain { phase: "", total: 0, tokens: 0, batches: 0, started: Instant::now() }),
         }
     }
 
@@ -73,7 +93,7 @@ impl Progress {
         Progress {
             live: None,
             silent: true,
-            plain: Mutex::new(Plain { phase: "", total: 0, tokens: 0, batches: 0 }),
+            plain: Mutex::new(Plain { phase: "", total: 0, tokens: 0, batches: 0, started: Instant::now() }),
         }
     }
 
@@ -83,7 +103,7 @@ impl Progress {
         Progress {
             live: Some(Live::new(multi)),
             silent: false,
-            plain: Mutex::new(Plain { phase: "", total: 0, tokens: 0, batches: 0 }),
+            plain: Mutex::new(Plain { phase: "", total: 0, tokens: 0, batches: 0, started: Instant::now() }),
         }
     }
 
@@ -99,40 +119,55 @@ impl Progress {
         }
     }
 
-    /// Reveal the bars with the run totals (`total_chunks` is an estimate).
+    /// Reveal the yarn-style UI with the run totals (`total_chunks` is an
+    /// estimate).
     pub fn begin(&self, total_files: u64, total_chunks: u64) {
-        lock(&self.plain).total = total_chunks;
+        {
+            let mut p = lock(&self.plain);
+            p.total = total_chunks;
+            p.started = Instant::now();
+        }
         if let Some(l) = &self.live {
-            let files = l.multi.add(ProgressBar::new(total_files));
-            files.set_style(files_style());
-            let chunks = l.multi.add(ProgressBar::new(total_chunks));
-            chunks.set_style(chunks_style());
-            files.enable_steady_tick(Duration::from_millis(120));
-            chunks.enable_steady_tick(Duration::from_millis(120));
-            *lock(&l.bars) = Some(Bars { files, chunks });
+            let header = l.multi.add(ProgressBar::new_spinner());
+            header.set_style(files_style());
+            header.enable_steady_tick(Duration::from_millis(120));
+            header.set_message("rag index");
+            *lock(&l.yarn) = Some(Yarn {
+                header,
+                tier: String::new(),
+                total_files,
+                total_chunks,
+                files_done: 0,
+                active: None,
+                active_name: String::new(),
+                started: Instant::now(),
+            });
         }
     }
 
     /// Label the current tier and, in plain mode, report its share.
     pub fn phase(&self, tier: Tier, files: u64, est_chunks: u64) {
         lock(&self.plain).phase = tier.as_str();
-        if self.silent {
-            return;
-        }
         match &self.live {
             Some(l) => {
-                if let Some(bars) = lock(&l.bars).as_ref() {
-                    bars.files.set_message(tier.as_str());
+                if let Some(y) = lock(&l.yarn).as_mut() {
+                    y.tier = tier.as_str().to_string();
+                    y.header.set_message(format!("rag index — embedding {}", tier.as_str()));
                 }
             }
-            None => eprintln!("[rag] embedding {}: {files} files (~{est_chunks} chunks)", tier.as_str()),
+            None => {
+                if !self.silent {
+                    eprintln!("[rag] embedding {}: {files} files (~{est_chunks} chunks)", tier.as_str())
+                }
+            }
         }
     }
 
     pub fn file_done(&self, n: u64) {
         if let Some(l) = &self.live {
-            if let Some(bars) = lock(&l.bars).as_ref() {
-                bars.files.inc(n);
+            if let Some(y) = lock(&l.yarn).as_mut() {
+                y.files_done += n;
+                y.refresh_header();
             }
         }
     }
@@ -148,21 +183,39 @@ impl Progress {
         match &self.live {
             Some(l) => {
                 let tokens = l.tokens.fetch_add(batch_tokens, Ordering::Relaxed) + batch_tokens;
-                if let Some(bars) = lock(&l.bars).as_ref() {
-                    bars.chunks.set_position(done);
-                    bars.chunks
-                        .set_message(format!("{current} · {} tokens", crate::ops::fmt_tokens(tokens)));
+                if let Some(y) = lock(&l.yarn).as_mut() {
+                    let elapsed = y.started.elapsed();
+                    y.refresh_header_full(done, tokens, elapsed);
+                    if !current.is_empty() {
+                        if current != y.active_name {
+                            if let Some(prev) = y.active.take() {
+                                prev.finish_with_message(format!("✔ {}", y.active_name));
+                                y.files_done += 1;
+                            }
+                            let bar = l.multi.add(ProgressBar::new_spinner());
+                            bar.set_style(file_style());
+                            bar.enable_steady_tick(Duration::from_millis(120));
+                            bar.set_message(current.to_string());
+                            y.active = Some(bar);
+                            y.active_name = current.to_string();
+                        }
+                        if let Some(bar) = y.active.as_ref() {
+                            bar.set_message(format!("{current} — {} tok/s", rate(tokens, elapsed)));
+                        }
+                    }
                 }
             }
             None => {
                 if print && !self.silent {
                     let p = lock(&self.plain);
                     eprintln!(
-                        "[rag] {} {}/{} chunks (~{} tokens)",
+                        "[rag] {} {}/{} chunks (~{} tokens, {} tok/s, {}/s chunks)",
                         p.phase,
                         done,
                         p.total,
-                        crate::ops::fmt_tokens(p.tokens)
+                        crate::ops::fmt_tokens(p.tokens),
+                        rate(p.tokens, p.started.elapsed()),
+                        rate(done, p.started.elapsed()),
                     );
                 }
             }
@@ -174,11 +227,13 @@ impl Progress {
         if self.live.is_none() && !self.silent {
             let p = lock(&self.plain);
             eprintln!(
-                "[rag] {} {}/{} chunks (~{} tokens)",
+                "[rag] {} {}/{} chunks (~{} tokens, {} tok/s, {}/s chunks)",
                 p.phase,
                 done,
                 p.total,
-                crate::ops::fmt_tokens(p.tokens)
+                crate::ops::fmt_tokens(p.tokens),
+                rate(p.tokens, p.started.elapsed()),
+                rate(done, p.started.elapsed()),
             );
         }
     }
@@ -186,26 +241,63 @@ impl Progress {
     /// Clear the live UI; the final report follows on stdout.
     pub fn finish(&self) {
         if let Some(l) = &self.live {
-            if let Some(bars) = lock(&l.bars).take() {
-                bars.files.finish_and_clear();
-                bars.chunks.finish_and_clear();
+            if let Some(mut y) = lock(&l.yarn).take() {
+                if let Some(bar) = y.active.take() {
+                    bar.finish_with_message(format!("✔ {}", y.active_name));
+                }
+                let elapsed = y.started.elapsed().as_secs_f64();
+                y.header.finish_with_message(format!(
+                    "✔ rag index — {} files, {} chunks in {:.1}s",
+                    y.files_done, y.total_chunks, elapsed
+                ));
             }
         }
     }
 }
 
+impl Yarn {
+    fn refresh_header(&self) {
+        self.header.set_message(format!(
+            "rag index{} — {}/{} files",
+            self.tier_suffix(),
+            self.files_done,
+            self.total_files
+        ));
+    }
+
+    fn refresh_header_full(&self, chunks_done: u64, tokens: u64, elapsed: Duration) {
+        self.header.set_message(format!(
+            "rag index{} — {}/{} files · {}/{} chunks · {} tokens · {} tok/s · {}/s chunks",
+            self.tier_suffix(),
+            self.files_done,
+            self.total_files,
+            chunks_done,
+            self.total_chunks,
+            crate::ops::fmt_tokens(tokens),
+            rate(tokens, elapsed),
+            rate(chunks_done, elapsed),
+        ));
+    }
+
+    fn tier_suffix(&self) -> String {
+        if self.tier.is_empty() { String::new() } else { format!(" [{}]", self.tier) }
+    }
+}
+
 impl Live {
     fn new(multi: MultiProgress) -> Self {
-        Live { multi, bars: Mutex::new(None), tokens: AtomicU64::new(0) }
+        Live { multi, yarn: Mutex::new(None), tokens: AtomicU64::new(0) }
     }
 }
 
 impl Drop for Progress {
     fn drop(&mut self) {
         if let Some(l) = self.live.take() {
-            if let Some(bars) = l.bars.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner()) {
-                bars.files.finish_and_clear();
-                bars.chunks.finish_and_clear();
+            if let Some(mut y) = l.yarn.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner()) {
+                if let Some(bar) = y.active.take() {
+                    bar.finish_with_message(format!("✔ {}", y.active_name));
+                }
+                y.header.finish_and_clear();
             }
         }
     }
@@ -236,7 +328,14 @@ mod tests {
     fn templates_parse() {
         // Invalid templates only surface at first draw otherwise.
         files_style();
-        chunks_style();
+        file_style();
+    }
+
+    #[test]
+    fn rate_formats() {
+        assert_eq!(rate(100, Duration::ZERO), "—");
+        assert_eq!(rate(40, Duration::from_secs(2)), "20");
+        assert_eq!(rate(2400, Duration::from_secs(2)), "1.2k");
     }
 
     #[test]
@@ -312,17 +411,16 @@ mod tests {
         prog.begin(10, 40);
         prog.phase(Tier::P0, 6, 24);
         prog.file_done(1);
-        // The files bar redraws on its 120ms steady ticker (its position is
-        // otherwise only cached by the multi), so give it a beat.
+        // The header spinner redraws on its 120ms steady ticker, so give it a beat.
         std::thread::sleep(Duration::from_millis(300));
         prog.batch(3, 120, "src/main.rs");
         prog.finish();
 
         let out = lock(&buf).clone();
+        assert!(out.contains("rag index"), "header spinner missing in: {out:?}");
         assert!(out.contains("P0"), "tier label missing in: {out:?}");
-        assert!(out.contains("1/10 files"), "files progress missing in: {out:?}");
-        assert!(out.contains("3/40 chunks"), "chunks progress missing in: {out:?}");
+        assert!(out.contains("3/40 chunks"), "chunk progress missing in: {out:?}");
         assert!(out.contains("src/main.rs"), "current file missing in: {out:?}");
-        assert!(out.contains("120 tokens"), "token count missing in: {out:?}");
+        assert!(out.contains("tok/s"), "embedding rate missing in: {out:?}");
     }
 }

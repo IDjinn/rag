@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.4.0 — 2026-10-11
+
+### Added
+
+- **Embedding throughput in the index UI** — live progress now shows
+  tok/s and chunks/s (computed from the embedding wall clock), in both
+  the interactive display and the plain one-line mode; the final
+  `rag index` report gained a `{chunks}/s · {tok}/s` summary on the
+  "Chunks embedded" line.
+
+### Changed
+
+- **Yarn-style live progress** — the two-bar index display was replaced
+  by a yarn-like interface: one persistent header spinner (`➤ ⠙ rag index …`)
+  with files/chunks/tokens/throughput, one spinner line per file being
+  embedded (path + tok/s), and each finished file checked off as
+  `✔ <file>`.
+
 ## 0.3.0 — 2026-10-10
 
 ### Added
