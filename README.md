@@ -14,6 +14,11 @@ statistics so you can tell whether it is paying off.
   `index.auto_refresh: false` or `RAG_AUTO_REFRESH=0`. Incremental runs only
   embed changed files, and checkpoints every few thousand chunks keep work
   across crashes.
+- **Move/rename/copy awareness** — files matched by content hash (SHA-1)
+  adopt their existing embeddings instead of being re-embedded: renaming or
+  moving a folder costs zero embedding requests, and copied files reuse the
+  source vectors. Only genuinely new or edited content reaches the
+  embedding backend.
 - **Interactive progress** — `rag index` shows live bars on a terminal
   (files + ETA, chunks, current file, tokens); under pipes/CI or with
   `--no-progress` it falls back to plain one-line reports on stderr.
@@ -69,9 +74,11 @@ After that, `rag serve` keeps it current on its own:
 - **Each tick** — a stat-only walk (mtime/size, the same ignore rules as
   indexing) diffs the root against the index. Changed/new files are content-
   hashed and re-embedded only if the hash differs; removed files are dropped.
-  An idle tick costs one directory walk, zero network requests and writes
-  nothing to disk. Searches never wait for a refresh (per-root locks keep the
-  `index.json`/`vectors.bin` pair consistent).
+  Files whose hash matches an entry anywhere in the index — moved, renamed,
+  copied, or merely touched — adopt that entry's vectors at no embedding
+  cost. An idle tick costs one directory walk, zero network requests and
+  writes nothing to disk. Searches never wait for a refresh (per-root locks
+  keep the `index.json`/`vectors.bin` pair consistent).
 - **Errors** — if the embedding server is down or unloaded, the loop logs one
   stderr line and backs off exponentially (up to 5 minutes), resetting on the
   first success. Search results still flag `⚠️ changed since indexing` in the

@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.5.0 — 2026-10-12
+
+### Added
+
+- **Move/rename/copy awareness** — files whose content hash matches any
+  entry in the existing index now adopt that entry's vectors instead of
+  being re-embedded. Renaming or moving a folder drops from N embedding
+  requests to zero (cost becomes file reads + hashing + one vectors
+  rewrite), copied files reuse the source vectors, and the index report
+  gained a "Reused by content" line splitting moved/renamed vs copied vs
+  touched. `rag stats` tracks cumulative reuse (`files_reused`).
+
 ## 0.4.0 — 2026-10-11
 
 ### Added

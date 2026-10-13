@@ -27,6 +27,9 @@ pub struct RagStats {
     pub last_index_ms: Option<u64>,
     pub files_indexed: u64,
     pub files_skipped: u64,
+    /// Files whose vectors were adopted from a matching content hash
+    /// (touched files, plus moves/renames/copies) instead of re-embedding.
+    pub files_reused: u64,
     pub files_removed: u64,
     pub chunks_embedded: u64,
     pub embed_requests: u64,

@@ -113,6 +113,62 @@ fn visible_chunks(base: usize, chunk_count: usize, dim: usize, rows_len: usize) 
     chunk_count.min(avail)
 }
 
+/// Old-index entries keyed by content hash, so moved/renamed/copied files
+/// can adopt the vectors already paid for. First path wins on duplicate
+/// content (deterministic: BTreeMap order).
+fn hash_map_of(old: Option<&IndexData>) -> HashMap<&str, (&str, &FileEntry)> {
+    let mut map: HashMap<&str, (&str, &FileEntry)> = HashMap::new();
+    if let Some(o) = old {
+        for (rel, e) in &o.files {
+            map.entry(e.hash.as_str()).or_insert((rel.as_str(), e));
+        }
+    }
+    map
+}
+
+/// Copy a file's vector rows from the old vectors blob into the new buffer.
+/// Returns false when the blob doesn't actually hold them (missing or
+/// mismatched vectors.bin) so the caller can fall back to embedding.
+fn copy_old_rows(
+    old_rows: Option<&[f32]>,
+    entry: &FileEntry,
+    old_dim: usize,
+    vectors: &mut Vec<f32>,
+) -> bool {
+    let Some(rows) = old_rows else {
+        return false;
+    };
+    if old_dim == 0 {
+        return false;
+    }
+    let from = entry.vec_offset * old_dim;
+    let to = from + entry.chunk_count * old_dim;
+    if to > rows.len() {
+        return false;
+    }
+    vectors.extend_from_slice(&rows[from..to]);
+    true
+}
+
+/// Split content reuses into moved/renamed vs copied: if the matched old
+/// path is still present in the new index the file was copied from it,
+/// otherwise it moved. Same-path matches are plain mtime churn — neither.
+fn classify_reuses(reuse_log: &[(String, String)], data: &IndexData) -> (u64, u64) {
+    let mut moved = 0u64;
+    let mut copied = 0u64;
+    for (new_rel, src_rel) in reuse_log {
+        if new_rel == src_rel {
+            continue;
+        }
+        if data.files.contains_key(src_rel) {
+            copied += 1;
+        } else {
+            moved += 1;
+        }
+    }
+    (moved, copied)
+}
+
 // ---------------------------------------------------------------------------
 // rag_index
 // ---------------------------------------------------------------------------
@@ -245,6 +301,11 @@ pub(crate) async fn index_run(opts: IndexOpts) -> Result<IndexOutcome> {
         }
     }
     let old_mmap = old.as_ref().and_then(|_| store.mmap_vectors());
+    let old_rows = old_mmap.as_ref().map(|m| vectors_as_slice(m));
+    let old_by_hash = hash_map_of(old.as_ref());
+    // (new rel, old rel the vectors came from) — classified as moved vs
+    // copied once the run knows which old paths survived.
+    let mut reuse_log: Vec<(String, String)> = Vec::new();
     let removed = old
         .as_ref()
         .map(|o| {
@@ -278,14 +339,7 @@ pub(crate) async fn index_run(opts: IndexOpts) -> Result<IndexOutcome> {
         for f in all_files.iter().filter(|f| f.tier == tier) {
             if let Some(entry) = old.as_ref().and_then(|o| o.files.get(&f.rel)) {
                 if files::same_state((entry.mtime_ms, entry.size), (f.mtime_ms, f.size)) && old_dim > 0 {
-                    if let Some(mmap) = &old_mmap {
-                        let rows = vectors_as_slice(mmap);
-                        let from = entry.vec_offset * old_dim;
-                        let to = from + entry.chunk_count * old_dim;
-                        if to <= rows.len() {
-                            vectors.extend_from_slice(&rows[from..to]);
-                        }
-                    }
+                    copy_old_rows(old_rows, entry, old_dim, &mut vectors);
                     let mut e = entry.clone();
                     e.vec_offset = data.vector_count;
                     data.vector_count += e.chunk_count;
@@ -327,8 +381,9 @@ pub(crate) async fn index_run(opts: IndexOpts) -> Result<IndexOutcome> {
             window_est += (f.size as usize / config::settings().index.chunk_target_chars).max(1);
             if window_est >= window_target {
                 let (ms, staged) = embed_and_commit(
-                    &window, &mut data, &mut vectors, old.as_ref(), old_mmap.as_ref(), old_dim,
-                    &client, &model, batch, concurrency, tier, &prog, chunk_base, &mut counters,
+                    &window, tier, &mut data, &mut vectors, old_rows, old_dim,
+                    &old_by_hash, &mut reuse_log,
+                    &client, &model, batch, concurrency, &prog, chunk_base, &mut counters,
                 )
                 .await?;
                 last_index_ms += ms;
@@ -347,8 +402,9 @@ pub(crate) async fn index_run(opts: IndexOpts) -> Result<IndexOutcome> {
         }
         if !window.is_empty() {
             let (ms, staged) = embed_and_commit(
-                &window, &mut data, &mut vectors, old.as_ref(), old_mmap.as_ref(), old_dim,
-                &client, &model, batch, concurrency, tier, &prog, chunk_base, &mut counters,
+                &window, tier, &mut data, &mut vectors, old_rows, old_dim,
+                &old_by_hash, &mut reuse_log,
+                &client, &model, batch, concurrency, &prog, chunk_base, &mut counters,
             )
             .await?;
             last_index_ms += ms;
@@ -360,6 +416,7 @@ pub(crate) async fn index_run(opts: IndexOpts) -> Result<IndexOutcome> {
 
     data.vector_count = if data.dim > 0 { vectors.len() / data.dim } else { 0 };
     data.updated_at = store::now_iso();
+    let (moved, copied) = classify_reuses(&reuse_log, &data);
     {
         let _store_guard = lock_store(&locks);
         store.save(&data, &vectors)?;
@@ -374,6 +431,7 @@ pub(crate) async fn index_run(opts: IndexOpts) -> Result<IndexOutcome> {
         s.last_index_ms = Some(last_index_ms);
         s.files_indexed += counters.embedded_files;
         s.files_skipped += counters.skipped;
+        s.files_reused += counters.reused;
         s.files_removed += removed;
         s.chunks_embedded += counters.embedded_chunks;
         s.embed_requests += counters.requests;
@@ -396,11 +454,22 @@ pub(crate) async fn index_run(opts: IndexOpts) -> Result<IndexOutcome> {
     };
     let p0 = data.files.values().filter(|e| e.tier == Tier::P0).count();
     let p1 = data.files.len() - p0;
+    let reuse_line = if counters.reused > 0 {
+        format!(
+            "\n- **Reused by content:** {} file(s) — {} moved/renamed, {} copied, {} touched (zero embeddings)",
+            counters.reused,
+            moved,
+            copied,
+            counters.reused - moved - copied
+        )
+    } else {
+        String::new()
+    };
     let report = format!(
         "## rag index complete\n\n\
          - **Root:** {root_str}\n\
          - **Provider:** {} — **Model:** {model} (dim {})\n\
-         - **Files in index:** {} (P0: {p0}, P1: {p1}) — {} embedded, {} unchanged, {removed} removed\n\
+         - **Files in index:** {} (P0: {p0}, P1: {p1}) — {} embedded, {} unchanged, {removed} removed{reuse_line}\n\
          - **Chunks embedded:** {} (~{} tokens, {} request(s), {:.1}s, {embed_rate})\n\
          - **Total vectors:** {} | index size: {:.0} KB\n\
          - **Wall time:** {:.1}s\n\n\
@@ -440,88 +509,117 @@ struct EmbedCounters {
     embed_ms: u64,
 }
 
-/// Read, chunk, embed and commit one window of files. Returns the embedding
-/// wall time and the number of chunks staged (for progress bookkeeping).
+/// One file queued for embedding by [`stage_window`].
+struct EmbedJob<'a> {
+    rel: &'a str,
+    size: u64,
+    mtime_ms: i64,
+    hash: String,
+    refs: Vec<store::ChunkRef>,
+    texts: Vec<String>,
+    first_row: usize,
+}
+
+/// Sync staging for one window: files whose content already has vectors in
+/// the old index — the same path after a touch (mtime churn) or a different
+/// path (moved, renamed, copied) — adopt those vectors directly; only
+/// genuinely new content is queued for embedding. Job rows are appended to
+/// `vectors` (and `vec_offset` resolved) after the embedding round-trip, so
+/// reuse rows committed here may precede them within the same window.
 #[allow(clippy::too_many_arguments)]
-async fn embed_and_commit(
-    window: &[&DiscoveredFile],
+fn stage_window<'a>(
+    window: &[&'a DiscoveredFile],
+    tier: Tier,
     data: &mut IndexData,
     vectors: &mut Vec<f32>,
-    old: Option<&IndexData>,
-    old_mmap: Option<&Mmap>,
+    old_rows: Option<&[f32]>,
     old_dim: usize,
-    client: &LmClient,
-    model: &str,
-    batch: usize,
-    concurrency: usize,
-    tier: Tier,
-    prog: &Progress,
-    chunk_base: u64,
+    old_by_hash: &HashMap<&str, (&str, &FileEntry)>,
+    reuse_log: &mut Vec<(String, String)>,
     counters: &mut EmbedCounters,
-) -> Result<(u64, usize)> {
-    struct Job<'a> {
-        rel: &'a str,
-        size: u64,
-        mtime_ms: i64,
-        hash: String,
-        refs: Vec<store::ChunkRef>,
-        first_row: usize,
-    }
-    let mut jobs: Vec<Job<'_>> = Vec::new();
-    let mut texts: Vec<String> = Vec::new();
+) -> Vec<EmbedJob<'a>> {
+    let mut jobs: Vec<EmbedJob<'a>> = Vec::new();
     let mut staged = 0usize;
-
     for f in window {
         let Some(text) = files::read_text(&f.abs) else {
             continue; // binary or unreadable
         };
         let hash = store::sha1_hex(&text);
-        if let Some(entry) = old.and_then(|o| o.files.get(&f.rel)) {
-            if entry.hash == hash {
-                if old_dim > 0 {
-                    if let Some(mmap) = old_mmap {
-                        let rows = vectors_as_slice(mmap);
-                        let from = entry.vec_offset * old_dim;
-                        let to = from + entry.chunk_count * old_dim;
-                        if to <= rows.len() {
-                            vectors.extend_from_slice(&rows[from..to]);
-                        }
-                    }
-                }
-                let mut e = entry.clone();
-                e.vec_offset = data.vector_count;
-                // Refresh the stat-level state: otherwise a touched-but-unchanged
-                // file stays "pending" in every later run (mtime churn).
-                e.mtime_ms = f.mtime_ms;
-                e.size = f.size;
-                data.vector_count += e.chunk_count;
-                data.files.insert(f.rel.to_string(), e);
-                counters.reused += 1;
-                continue;
-            }
+        let reuse = old_by_hash
+            .get(hash.as_str())
+            .and_then(|(src_rel, src_entry)| {
+                copy_old_rows(old_rows, src_entry, old_dim, vectors)
+                    .then(|| (*src_rel, (*src_entry).clone()))
+            });
+        if let Some((src_rel, mut e)) = reuse {
+            // Refresh the stat-level state: otherwise a touched-but-unchanged
+            // file stays "pending" in every later run (mtime churn).
+            e.mtime_ms = f.mtime_ms;
+            e.size = f.size;
+            e.tier = tier;
+            e.vec_offset = data.vector_count;
+            data.vector_count += e.chunk_count;
+            data.files.insert(f.rel.clone(), e);
+            reuse_log.push((f.rel.clone(), src_rel.to_string()));
+            counters.reused += 1;
+            continue;
         }
         let chunks = chunk::chunk_default(&text);
         if chunks.is_empty() {
             continue;
         }
-        jobs.push(Job {
+        let refs: Vec<store::ChunkRef> =
+            chunks.iter().map(|c| store::ChunkRef { start: c.start, end: c.end }).collect();
+        let first_row = staged;
+        staged += refs.len();
+        jobs.push(EmbedJob {
             rel: f.rel.as_str(),
             size: f.size,
             mtime_ms: f.mtime_ms,
             hash,
-            refs: chunks.iter().map(|c| store::ChunkRef { start: c.start, end: c.end }).collect(),
-            first_row: staged,
+            refs,
+            texts: chunks.into_iter().map(|c| c.text).collect(),
+            first_row,
         });
-        staged += chunks.len();
-        texts.extend(chunks.iter().map(|c| c.text.clone()));
     }
-    if texts.is_empty() {
+    jobs
+}
+
+/// Read, chunk, embed and commit one window of files. Returns the embedding
+/// wall time and the number of chunks staged (for progress bookkeeping).
+#[allow(clippy::too_many_arguments)]
+async fn embed_and_commit(
+    window: &[&DiscoveredFile],
+    tier: Tier,
+    data: &mut IndexData,
+    vectors: &mut Vec<f32>,
+    old_rows: Option<&[f32]>,
+    old_dim: usize,
+    old_by_hash: &HashMap<&str, (&str, &FileEntry)>,
+    reuse_log: &mut Vec<(String, String)>,
+    client: &LmClient,
+    model: &str,
+    batch: usize,
+    concurrency: usize,
+    prog: &Progress,
+    chunk_base: u64,
+    counters: &mut EmbedCounters,
+) -> Result<(u64, usize)> {
+    let mut jobs = stage_window(
+        window, tier, data, vectors, old_rows, old_dim, old_by_hash, reuse_log, counters,
+    );
+    if jobs.is_empty() {
         return Ok((0, 0));
     }
+    let staged: usize = jobs.iter().map(|j| j.refs.len()).sum();
 
     // Map the chunk-row frontier back to the file being embedded so the
     // progress UI can show it.
     let rows: Vec<(usize, &str)> = jobs.iter().map(|j| (j.first_row, j.rel)).collect();
+    let mut texts: Vec<String> = Vec::new();
+    for job in &mut jobs {
+        texts.append(&mut job.texts);
+    }
     let mut on_batch = |done: usize, tokens: u64| {
         prog.batch(chunk_base + done as u64, tokens, current_file(&rows, done));
     };
@@ -956,8 +1054,10 @@ pub fn stats(root_path: Option<&str>, reset: bool) -> Result<String> {
         .unwrap_or_default();
     let embed_errors =
         if s.embed_errors > 0 { format!(" · {} embed errors", s.embed_errors) } else { String::new() };
+    let reused_note =
+        if s.files_reused > 0 { format!(" · {} reused by content", s.files_reused) } else { String::new() };
     out.push_str(&format!(
-        "- **Index cost:** {} run(s) · ~{} tokens embedded · {:.1}s{amortized}{spend}{embed_errors}\n",
+        "- **Index cost:** {} run(s) · ~{} tokens embedded · {:.1}s{amortized}{spend}{embed_errors}{reused_note}\n",
         s.index_runs,
         fmt_tokens(s.embed_tokens),
         s.embed_ms as f64 / 1000.0,
@@ -1164,6 +1264,155 @@ mod tests {
         assert_eq!(visible_chunks(4, 1, 4, 8), 1);
         // Guard rails.
         assert_eq!(visible_chunks(0, 2, 0, 8), 0);
+    }
+
+    fn write_temp_file(dir: &Path, rel: &str, content: &str) -> DiscoveredFile {
+        let abs = dir.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, content).unwrap();
+        let md = std::fs::metadata(&abs).unwrap();
+        DiscoveredFile {
+            abs,
+            rel: rel.to_string(),
+            size: md.len(),
+            mtime_ms: md
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64,
+            tier: Tier::P0,
+        }
+    }
+
+    fn empty_index(dim: usize) -> IndexData {
+        let mut data = IndexData::empty("root", "m");
+        data.dim = dim;
+        data
+    }
+
+    #[test]
+    fn copy_old_rows_copies_and_guards() {
+        let rows = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let mut out = Vec::new();
+        let mut e = entry(10, 100);
+        e.vec_offset = 1;
+        assert!(copy_old_rows(Some(&rows), &e, 4, &mut out));
+        assert_eq!(out, vec![5.0, 6.0, 7.0, 8.0]);
+
+        // Claimed rows past the blob end: refuse so the caller embeds instead.
+        e.vec_offset = 2;
+        out.clear();
+        assert!(!copy_old_rows(Some(&rows), &e, 4, &mut out));
+        assert!(out.is_empty());
+
+        // No blob at all, or unusable dim.
+        assert!(!copy_old_rows(None, &e, 4, &mut out));
+        e.vec_offset = 0;
+        assert!(!copy_old_rows(Some(&rows), &e, 0, &mut out));
+    }
+
+    #[test]
+    fn stage_window_adopts_moved_files_without_embedding() {
+        // Folder renamed: the old path is gone from disk, the content is not.
+        let dir = std::env::temp_dir().join(format!("rag-move-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = "fn main() { moved, not edited }";
+        let f = write_temp_file(&dir, "new/a.rs", text);
+
+        let mut old = index_with(&[("old/a.rs", entry(10, 100))]);
+        let e = old.files.get_mut("old/a.rs").unwrap();
+        e.hash = store::sha1_hex(text);
+
+        let mut data = empty_index(4);
+        let mut vectors = Vec::new();
+        let mut counters = EmbedCounters::default();
+        let mut reuse_log = Vec::new();
+        let old_by_hash = hash_map_of(Some(&old));
+
+        let jobs = stage_window(
+            &[&f], Tier::P0, &mut data, &mut vectors, Some(&[0.5; 4]), 4,
+            &old_by_hash, &mut reuse_log, &mut counters,
+        );
+
+        assert!(jobs.is_empty(), "a moved file must not be re-embedded");
+        assert_eq!(counters.reused, 1);
+        assert_eq!(reuse_log, vec![("new/a.rs".to_string(), "old/a.rs".to_string())]);
+        assert_eq!(vectors, vec![0.5; 4]);
+        let adopted = &data.files["new/a.rs"];
+        assert_eq!(adopted.vec_offset, 0);
+        assert_eq!(adopted.chunk_count, 1);
+        assert_eq!(adopted.mtime_ms, f.mtime_ms, "stat state must be refreshed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stage_window_reembeds_moved_files_with_new_content() {
+        let dir = std::env::temp_dir().join(format!("rag-move-edit-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = "fn main() { moved AND edited }";
+        let f = write_temp_file(&dir, "new/a.rs", text);
+
+        let old = index_with(&[("old/a.rs", entry(10, 100))]); // hash "h": no match
+
+        let mut data = empty_index(4);
+        let mut vectors = Vec::new();
+        let mut counters = EmbedCounters::default();
+        let mut reuse_log = Vec::new();
+        let old_by_hash = hash_map_of(Some(&old));
+
+        let jobs = stage_window(
+            &[&f], Tier::P0, &mut data, &mut vectors, Some(&[0.5; 4]), 4,
+            &old_by_hash, &mut reuse_log, &mut counters,
+        );
+
+        assert_eq!(jobs.len(), 1, "edited content must be queued for embedding");
+        assert_eq!(counters.reused, 0);
+        assert!(reuse_log.is_empty());
+        assert!(vectors.is_empty(), "nothing may be copied before the embed call");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stage_window_falls_back_to_embedding_when_blob_is_short() {
+        let dir = std::env::temp_dir().join(format!("rag-short-blob-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = "fn main() { identical content, blob too short }";
+        let f = write_temp_file(&dir, "new/a.rs", text);
+
+        let mut old = index_with(&[("old/a.rs", entry(10, 100))]);
+        old.files.get_mut("old/a.rs").unwrap().hash = store::sha1_hex(text);
+
+        let mut data = empty_index(4);
+        let mut vectors = Vec::new();
+        let mut counters = EmbedCounters::default();
+        let mut reuse_log = Vec::new();
+        let old_by_hash = hash_map_of(Some(&old));
+
+        // Entry claims 1 chunk (4 f32) but the blob holds nothing usable.
+        let jobs = stage_window(
+            &[&f], Tier::P0, &mut data, &mut vectors, Some(&[]), 4,
+            &old_by_hash, &mut reuse_log, &mut counters,
+        );
+
+        assert_eq!(jobs.len(), 1, "missing rows must fall back to embedding");
+        assert_eq!(counters.reused, 0);
+        assert!(data.files.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn classify_reuses_splits_moved_from_copied() {
+        let mut data = empty_index(4);
+        data.files.insert("src.rs".to_string(), entry(10, 100));
+        let log = vec![
+            ("b/x.rs".to_string(), "a/x.rs".to_string()), // a/x.rs gone → move
+            ("dst.rs".to_string(), "src.rs".to_string()), // src.rs survives → copy
+            ("t.rs".to_string(), "t.rs".to_string()),     // same path → mtime churn
+        ];
+        let (moved, copied) = classify_reuses(&log, &data);
+        assert_eq!(moved, 1);
+        assert_eq!(copied, 1);
     }
 
     #[test]
