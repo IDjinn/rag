@@ -2,7 +2,7 @@
 name = "rag"
 version = "0.5.0"
 edition = "2021"
-description = "Local RAG for ZCode: manual file indexing with LM Studio embeddings, SIMD search, cost/utility stats."
+description = "Local semantic code search for ZCode — one Rust binary: local vector index, MCP server, your embeddings."
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "time", "fs"] }
