@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.6.1 — 2026-10-15
+
+### Added
+
+- **Cortex integration roadmap** (`docs/cortex-integration.md`) — documents
+  what Cortex ([IDjinn/cortex](https://github.com/IDjinn/cortex)) already
+  depends on in the `rag` CLI (markdown output shapes, env contract,
+  `index.json` fields, index-dir keying) and the planned work to make that
+  integration robust: machine-readable `--json` output for
+  `search`/`status`/`index`, cross-process index locking, a Gemini embeddings
+  provider, structured MCP tool results, and smaller conveniences
+  (`--data-dir`, file/chunk caps, `clear --json`). No code changes.
+
 ## 0.6.0 — 2026-10-15
 
 ### Added

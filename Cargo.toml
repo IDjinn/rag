@@ -1,6 +1,6 @@
 [package]
 name = "rag"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 description = "Local semantic code search for ZCode — one Rust binary: local vector index, MCP server, your embeddings."
 
