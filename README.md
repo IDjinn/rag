@@ -50,7 +50,7 @@ Restart ZCode (or Settings → MCP) afterwards. Exposed tools:
 | --- | --- |
 | `rag index [PATH]` | Build or update the index (`--force`, `--dry-run`, `--no-progress`) |
 | `rag search "q" [--k 5] [--judge]` | Semantic search; `--judge` returns a ready-to-run `jev_triage` payload |
-| `rag stats [PATH]` | Cost/utility report (`--reset` clears it) |
+| `rag stats [PATH]` | Cost/utility report (`--reset` clears it; `--global` aggregates every indexed root) |
 | `rag status [PATH]` | Files, chunks, model, last index time |
 | `rag feedback --json '...'` | Record usefulness verdicts from searches |
 | `rag clear [PATH]` | Delete the index and its stats |

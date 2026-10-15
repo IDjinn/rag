@@ -47,6 +47,8 @@ struct ToolArgs {
     #[serde(default)]
     reset: Option<bool>,
     #[serde(default)]
+    global: Option<bool>,
+    #[serde(default)]
     verdicts: Option<Vec<ops::FeedbackVerdict>>,
 }
 
@@ -123,10 +125,11 @@ fn tools() -> Vec<Tool> {
         tool(
             "rag_stats",
             "RAG statistics",
-            "Show cost vs usefulness statistics for the index: embedding tokens/time spent, searches served, context delivered vs full-file reads avoided, jev-judged usefulness rate, and a verdict line.",
+            "Show cost vs usefulness statistics for the index: embedding tokens/time spent, searches served, context delivered vs full-file reads avoided, jev-judged usefulness rate, and a verdict line. Pass global:true to aggregate every indexed root instead (counters summed, query histories merged, per-root table).",
             json!({
                 "path": { "type": "string" },
-                "reset": { "type": "boolean", "description": "Zero the counters (keeps the index)" }
+                "reset": { "type": "boolean", "description": "Zero the counters (keeps the index)" },
+                "global": { "type": "boolean", "description": "Aggregate every indexed root instead of one" }
             }),
             &[],
         ),
@@ -222,8 +225,12 @@ impl ServerHandler for RagServer {
                         .map_err(|e| format!("{e:#}")),
                     None => Err("missing required argument: verdicts".to_string()),
                 },
-                "rag_stats" => ops::stats(args.path.as_deref(), args.reset.unwrap_or(false))
-                    .map_err(|e| format!("{e:#}")),
+                "rag_stats" => ops::stats(
+                    args.path.as_deref(),
+                    args.reset.unwrap_or(false),
+                    args.global.unwrap_or(false),
+                )
+                .map_err(|e| format!("{e:#}")),
                 "rag_clear" => ops::clear(args.path.as_deref()).await.map_err(|e| format!("{e:#}")),
                 other => Err(format!("unknown tool: {other}")),
             },

@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.6.0 — 2026-10-15
+
+### Added
+
+- **`rag stats --global`** — aggregate cost/utility report across every
+  indexed root under the data dir: counters summed, query histories merged
+  (newest first), and a per-root table of files, chunks, disk size and last
+  index time. `--global --reset` zeroes every root's counters in one go;
+  the flag conflicts with `PATH`, and the `rag_stats` MCP tool gained the
+  matching `global` argument.
+
 ## 0.5.0 — 2026-10-12
 
 ### Added

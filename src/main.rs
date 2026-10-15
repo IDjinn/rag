@@ -75,6 +75,10 @@ enum Command {
         /// Zero the counters (keeps the index)
         #[arg(long)]
         reset: bool,
+        /// Aggregate every indexed root instead of one: counters summed,
+        /// query histories merged, with a per-root breakdown table
+        #[arg(long, conflicts_with = "path")]
+        global: bool,
     },
     /// Index status and LM Studio reachability
     Status {
@@ -136,7 +140,9 @@ async fn run(command: Command) -> i32 {
             report(ops::search(&query, k, path.as_deref(), judge, no_boost).await)
         }
         Command::Config { init } => report(ops::config_cmd(init)),
-        Command::Stats { path, reset } => report(ops::stats(path.as_deref(), reset)),
+        Command::Stats { path, reset, global } => {
+            report(ops::stats(path.as_deref(), reset, global))
+        }
         Command::Status { path } => report(ops::status(path.as_deref()).await),
         Command::Clear { path } => report(ops::clear(path.as_deref()).await),
         Command::Feedback { json, path } => report(ops::feedback(&json, path.as_deref())),

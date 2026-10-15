@@ -58,13 +58,19 @@ struct RootLocks {
 }
 
 fn root_locks(root: &Path) -> Arc<RootLocks> {
+    locks_for_dir(&config::index_dir_for(root))
+}
+
+/// Same map keyed by the index directory itself, for commands that discover
+/// roots by scanning the data dir (`rag stats --global`) instead of holding a
+/// root path. Keying by directory keeps roots that map to the same index
+/// sharing one lock.
+fn locks_for_dir(dir: &Path) -> Arc<RootLocks> {
     static LOCKS: OnceLock<std::sync::Mutex<HashMap<PathBuf, Arc<RootLocks>>>> = OnceLock::new();
-    // Keyed by index directory so roots that map to the same index share locks.
-    let key = config::index_dir_for(root);
     let map = LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let mut guard = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     guard
-        .entry(key)
+        .entry(dir.to_path_buf())
         .or_insert_with(|| {
             Arc::new(RootLocks {
                 op: tokio::sync::Mutex::new(()),
@@ -981,7 +987,10 @@ fn savings_chart(history: &[QueryRecord], rows: usize) -> Option<String> {
     Some(out)
 }
 
-pub fn stats(root_path: Option<&str>, reset: bool) -> Result<String> {
+pub fn stats(root_path: Option<&str>, reset: bool, global: bool) -> Result<String> {
+    if global {
+        return stats_global(reset);
+    }
     let root = resolve_root(root_path);
     let store = Store::for_root(&root);
     let locks = root_locks(&root);
@@ -992,16 +1001,6 @@ pub fn stats(root_path: Option<&str>, reset: bool) -> Result<String> {
         stats::save(&store.dir, &s);
     }
     let data = store.load();
-
-    let hit_rate = if s.searches > 0 { s.search_hits * 100 / s.searches } else { 0 };
-    let useful_rate = if s.judged_chunks > 0 { Some(s.useful_chunks * 100 / s.judged_chunks) } else { None };
-    let saved_total = s.full_file_tokens_avoided.saturating_sub(s.context_tokens_delivered);
-    let saved_per_search = if s.searches > 0 { saved_total / s.searches } else { 0 };
-    let ratio = if s.context_tokens_delivered > 0 {
-        s.full_file_tokens_avoided as f64 / s.context_tokens_delivered as f64
-    } else {
-        0.0
-    };
     let disk_kb = store.disk_bytes() as f64 / 1024.0;
 
     let mut out = String::new();
@@ -1023,6 +1022,26 @@ pub fn stats(root_path: Option<&str>, reset: bool) -> Result<String> {
         None => out.push_str("- **Index:** none yet — run `rag index` once.\n"),
     }
 
+    out.push_str(&stats_body(&s, "for this root"));
+    out.push_str("\nUse `rag stats --reset` (or rag_stats with reset:true) to zero the counters (keeps the index).");
+    Ok(out)
+}
+
+/// The counters, verdict, savings chart and recent-queries body shared by the
+/// per-root and the global reports. `scope` appears in the verdict wording
+/// ("for this root" vs "for any of these roots").
+fn stats_body(s: &RagStats, scope: &str) -> String {
+    let hit_rate = if s.searches > 0 { s.search_hits * 100 / s.searches } else { 0 };
+    let useful_rate = if s.judged_chunks > 0 { Some(s.useful_chunks * 100 / s.judged_chunks) } else { None };
+    let saved_total = s.full_file_tokens_avoided.saturating_sub(s.context_tokens_delivered);
+    let saved_per_search = if s.searches > 0 { saved_total / s.searches } else { 0 };
+    let ratio = if s.context_tokens_delivered > 0 {
+        s.full_file_tokens_avoided as f64 / s.context_tokens_delivered as f64
+    } else {
+        0.0
+    };
+
+    let mut out = String::new();
     let usefulness = match useful_rate {
         Some(rate) => format!("{rate}% ({}/{} chunks)", s.useful_chunks, s.judged_chunks),
         None => "not measured".to_string(),
@@ -1064,15 +1083,15 @@ pub fn stats(root_path: Option<&str>, reset: bool) -> Result<String> {
     ));
 
     let verdict = if s.searches == 0 {
-        "No searches yet — embedding cost is paid but utility is unproven."
+        "No searches yet — embedding cost is paid but utility is unproven.".to_string()
     } else if useful_rate.is_some_and(|r| r < 40) {
-        "Judged usefulness is low — the index may not be worth keeping for this root."
+        format!("Judged usefulness is low — the index may not be worth keeping {scope}.")
     } else if ratio >= 3.0 {
-        "Paying off: search delivers a small fraction of the tokens full-file reads would cost."
+        "Paying off: search delivers a small fraction of the tokens full-file reads would cost.".to_string()
     } else if ratio >= 1.0 {
-        "Marginal — delivered context is comparable to just reading the matched files."
+        "Marginal — delivered context is comparable to just reading the matched files.".to_string()
     } else {
-        "Not paying off yet — few searches, or results nearly as big as the files."
+        "Not paying off yet — few searches, or results nearly as big as the files.".to_string()
     };
     out.push_str(&format!("\n**Verdict:** {verdict}\n"));
 
@@ -1096,7 +1115,129 @@ pub fn stats(root_path: Option<&str>, reset: bool) -> Result<String> {
             out.push_str(&format!("| {when} | {query} | {} | {:.2} | {judged} |\n", h.results, h.top_score));
         }
     }
-    out.push_str("\nUse `rag stats --reset` (or rag_stats with reset:true) to zero the counters (keeps the index).");
+    out
+}
+
+/// Every index directory under the data dir holding an index or stats, in a
+/// stable order. `indexes_root` is injected so tests can point at a scratch
+/// directory instead of the real `RAG_DATA_DIR`.
+fn collect_index_dirs(indexes_root: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let Ok(entries) = std::fs::read_dir(indexes_root) else {
+        return dirs;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if dir.is_dir() && (dir.join("index.json").is_file() || dir.join("stats.json").is_file()) {
+            dirs.push(dir);
+        }
+    }
+    dirs.sort();
+    dirs
+}
+
+fn all_index_dirs() -> Vec<PathBuf> {
+    collect_index_dirs(&config::data_dir().join("indexes"))
+}
+
+/// Sum per-root counters and merge their query histories (newest first,
+/// capped at HISTORY_LIMIT) into one aggregate for the global report.
+fn merged_totals(all: &[RagStats]) -> RagStats {
+    let mut totals = RagStats::default();
+    let mut history: Vec<QueryRecord> = Vec::new();
+    for s in all {
+        totals.index_runs += s.index_runs;
+        totals.files_indexed += s.files_indexed;
+        totals.files_skipped += s.files_skipped;
+        totals.files_reused += s.files_reused;
+        totals.files_removed += s.files_removed;
+        totals.chunks_embedded += s.chunks_embedded;
+        totals.embed_requests += s.embed_requests;
+        totals.embed_tokens += s.embed_tokens;
+        totals.embed_ms += s.embed_ms;
+        totals.embed_errors += s.embed_errors;
+        totals.searches += s.searches;
+        totals.search_results += s.search_results;
+        totals.search_hits += s.search_hits;
+        totals.search_ms += s.search_ms;
+        totals.search_errors += s.search_errors;
+        totals.context_tokens_delivered += s.context_tokens_delivered;
+        totals.full_file_tokens_avoided += s.full_file_tokens_avoided;
+        totals.judge_sessions += s.judge_sessions;
+        totals.judged_chunks += s.judged_chunks;
+        totals.useful_chunks += s.useful_chunks;
+        totals.p0_files += s.p0_files;
+        totals.p1_files += s.p1_files;
+        history.extend(s.history.iter().cloned());
+    }
+    history.sort_by(|a, b| b.ts.cmp(&a.ts));
+    history.truncate(config::HISTORY_LIMIT);
+    totals.history = history;
+    totals
+}
+
+/// Root label for the global report table. Windows-verbatim prefixes leak
+/// into stored roots through canonicalize (both the raw `\\?\C:/x` and the
+/// slash-normalized `//?/C:/x` spellings appear in index.json).
+fn display_root(root: &str) -> String {
+    let s = root.replace('\\', "/");
+    let s = s.strip_prefix("//?/UNC/").map(|r| format!("//{r}")).unwrap_or(s);
+    s.strip_prefix("//?/").unwrap_or(&s).to_string()
+}
+
+/// `rag stats --global`: one report over every indexed root under the data
+/// dir, with a per-root breakdown table on top of the summed counters.
+fn stats_global(reset: bool) -> Result<String> {
+    let dirs = all_index_dirs();
+    if dirs.is_empty() {
+        return Ok(format!(
+            "## rag_stats — all roots\n\nNo indexes found under `{}` — run `rag index` in a project first.\n",
+            config::data_dir().display()
+        ));
+    }
+
+    let mut rows: Vec<(String, Option<IndexData>, RagStats, u64)> = Vec::new();
+    for dir in &dirs {
+        let store = Store { dir: dir.clone() };
+        let data = store.load();
+        let label = data
+            .as_ref()
+            .map(|d| display_root(&d.root))
+            .unwrap_or_else(|| dir.file_name().unwrap_or_default().to_string_lossy().into_owned());
+        let locks = locks_for_dir(dir);
+        let s = if reset {
+            let _store_guard = lock_store(&locks);
+            stats::save(dir, &RagStats::default());
+            RagStats::default()
+        } else {
+            let _store_guard = lock_store(&locks);
+            stats::load(dir)
+        };
+        rows.push((label, data, s, store.disk_bytes()));
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let all: Vec<RagStats> = rows.iter().map(|(_, _, s, _)| s.clone()).collect();
+    let totals = merged_totals(&all);
+
+    let mut out = format!("## rag_stats — all roots ({})\n\n", rows.len());
+    out.push_str("| root | files | chunks | KB | last indexed |\n|---|---|---|---|---|\n");
+    for (label, data, _, kb) in &rows {
+        let label = label.replace('|', "\\|");
+        let kb = *kb as f64 / 1024.0;
+        match data {
+            Some(d) => out.push_str(&format!(
+                "| {label} | {} | {} | {kb:.0} | {} |\n",
+                d.files.len(),
+                d.vector_count,
+                d.updated_at.get(5..16).unwrap_or(&d.updated_at).replace('T', " ")
+            )),
+            None => out.push_str(&format!("| {label} | — | — | {kb:.0} | — |\n")),
+        }
+    }
+    out.push('\n');
+    out.push_str(&stats_body(&totals, "for any of these roots"));
+    out.push_str("\nUse `rag stats --global --reset` (or rag_stats with global:true and reset:true) to zero every root's counters (keeps the indexes).");
     Ok(out)
 }
 
@@ -1480,5 +1621,63 @@ mod tests {
             .collect();
         assert!(savings_chart(&history, SAVINGS_CHART_ROWS).is_none());
         assert!(savings_chart(&[], SAVINGS_CHART_ROWS).is_none());
+    }
+
+    #[test]
+    fn collect_index_dirs_lists_only_dirs_with_index_or_stats() {
+        let root = std::env::temp_dir().join(format!("rag-global-dirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let indexes = root.join("indexes");
+        std::fs::create_dir_all(indexes.join("a-index")).unwrap();
+        std::fs::write(indexes.join("a-index").join("index.json"), "{}").unwrap();
+        std::fs::create_dir_all(indexes.join("b-stats")).unwrap();
+        std::fs::write(indexes.join("b-stats").join("stats.json"), "{}").unwrap();
+        std::fs::create_dir_all(indexes.join("c-empty")).unwrap();
+        // A stray file and a nested dir are not index directories.
+        std::fs::write(indexes.join("loose.json"), "{}").unwrap();
+        std::fs::create_dir_all(indexes.join("d-sub").join("deeper")).unwrap();
+
+        let dirs = collect_index_dirs(&indexes);
+        let names: Vec<String> = dirs
+            .iter()
+            .map(|d| d.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["a-index", "b-stats"]); // sorted, noise excluded
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn merged_totals_sums_counters_and_merges_history_newest_first() {
+        let mut a = RagStats { searches: 3, search_hits: 1, embed_tokens: 100, ..Default::default() };
+        a.history = vec![query_record("2026-10-10T09:00:00Z", 10, 5)];
+        let mut b = RagStats { searches: 2, search_hits: 2, embed_tokens: 50, ..Default::default() };
+        b.history = vec![
+            query_record("2026-10-11T09:00:00Z", 20, 15),
+            query_record("2026-10-09T09:00:00Z", 1, 0),
+        ];
+
+        let totals = merged_totals(&[a, b]);
+        assert_eq!(totals.searches, 5);
+        assert_eq!(totals.search_hits, 3);
+        assert_eq!(totals.embed_tokens, 150);
+        let ts: Vec<&str> = totals.history.iter().map(|h| h.ts.as_str()).collect();
+        assert_eq!(
+            ts,
+            vec!["2026-10-11T09:00:00Z", "2026-10-10T09:00:00Z", "2026-10-09T09:00:00Z"]
+        );
+    }
+
+    #[test]
+    fn merged_totals_caps_the_merged_history() {
+        let mut a = RagStats::default();
+        a.history = (0..30)
+            .map(|i| query_record(&format!("2026-10-01T00:{i:02}:00Z"), 0, 0))
+            .collect();
+        let mut b = RagStats::default();
+        b.history = (30..60)
+            .map(|i| query_record(&format!("2026-10-01T00:{i:02}:00Z"), 0, 0))
+            .collect();
+        let totals = merged_totals(&[a, b]);
+        assert_eq!(totals.history.len(), crate::config::HISTORY_LIMIT);
     }
 }
