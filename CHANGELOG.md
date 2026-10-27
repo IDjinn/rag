@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.7.1 — 2026-10-26
+
+### Fixed
+
+- Version bump for local testing of `rag install` (no functional change
+  since 0.7.0).
+
 ## 0.7.0 — 2026-10-26
 
 ### Added
