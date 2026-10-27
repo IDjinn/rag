@@ -36,7 +36,7 @@ struct HookInput {
 /// Reads the hook payload from stdin and prints the additionalContext JSON
 /// when applicable. Any failure is silent by design — a hook must never
 /// surface errors into the session.
-pub fn run() -> std::io::Result<()> {
+pub fn run(claude_format: bool) -> std::io::Result<()> {
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf)?;
     let Ok(input) = serde_json::from_str::<HookInput>(buf.trim()) else {
@@ -54,9 +54,21 @@ pub fn run() -> std::io::Result<()> {
         _ => None,
     };
     if let Some(json) = payload {
-        println!("{json}");
+        println!("{}", if claude_format { to_claude(&json, event) } else { json });
     }
     Ok(())
+}
+
+/// Claude Code nests the context under `hookSpecificOutput` with the event name.
+fn to_claude(json: &str, event: &str) -> String {
+    let ctx = serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| v["additionalContext"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+    serde_json::json!({
+        "hookSpecificOutput": { "hookEventName": event, "additionalContext": ctx }
+    })
+    .to_string()
 }
 
 /// SessionStart payload: index facts plus the search-before-exploring flow.
@@ -165,6 +177,14 @@ mod tests {
         assert!(ctx.contains("no MCP tool access"));
         assert!(store.remove());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claude_format_nests_context() {
+        let out = to_claude(&additional_context("hello"), "SessionStart");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
+        assert_eq!(v["hookSpecificOutput"]["additionalContext"], "hello");
     }
 
     #[test]

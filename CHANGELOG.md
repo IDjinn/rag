@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.7.0 — 2026-10-26
+
+### Added
+
+- **`rag install`** — registers the MCP server in Claude Code, ZCode, OpenCode
+  and Codex; adds SessionStart/PreToolUse hooks (Claude, ZCode) or an
+  `AGENTS.md` instruction block (OpenCode, Codex). Global by default,
+  `--local` for the current project; `--dry-run`, `--uninstall`, `--mcp-only`.
+  Idempotent, preserves existing settings, one-time `*.rag.bak` backups.
+- `rag hook --format claude` emits Claude Code's `hookSpecificOutput` shape.
+
 ## 0.6.1 — 2026-10-15
 
 ### Added

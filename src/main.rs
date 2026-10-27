@@ -2,6 +2,7 @@ mod chunk;
 mod config;
 mod files;
 mod hook;
+mod install;
 mod lmstudio;
 mod mcp;
 mod ops;
@@ -103,7 +104,30 @@ enum Command {
     /// ZCode SessionStart hook: read the hook JSON on stdin and emit an
     /// additionalContext payload when the cwd has an index. Advisory only —
     /// prints nothing when unindexed and always exits 0.
-    Hook,
+    Hook {
+        /// Output dialect: `zcode` (top-level additionalContext) or `claude`
+        /// (hookSpecificOutput, for Claude Code)
+        #[arg(long, default_value = "zcode")]
+        format: String,
+    },
+    /// Register rag (MCP server + hooks/instructions) in coding agents:
+    /// claude, zcode, opencode, codex. Idempotent; backs up edited files.
+    Install {
+        /// Agents to configure, or `all` (default: every agent detected)
+        targets: Vec<String>,
+        /// Show what would change without writing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Remove rag from the selected agents instead
+        #[arg(long)]
+        uninstall: bool,
+        /// Register only the MCP server (no hooks / instructions)
+        #[arg(long)]
+        mcp_only: bool,
+        /// Configure this project (cwd) instead of the user-level configs
+        #[arg(long, short)]
+        local: bool,
+    },
     /// Show the effective YAML config, or write a default one with --init
     Config {
         /// Write a commented default config if none exists
@@ -146,9 +170,13 @@ async fn run(command: Command) -> i32 {
         Command::Status { path } => report(ops::status(path.as_deref()).await),
         Command::Clear { path } => report(ops::clear(path.as_deref()).await),
         Command::Feedback { json, path } => report(ops::feedback(&json, path.as_deref())),
-        Command::Hook => {
+        Command::Install { targets, dry_run, uninstall, mcp_only, local } => {
+            let scope = if local { install::Scope::Local } else { install::Scope::Global };
+            report(install::run(install::InstallOpts { targets, dry_run, uninstall, mcp_only, scope }))
+        }
+        Command::Hook { format } => {
             // A failing hook must never fail the session: swallow and exit 0.
-            if let Err(err) = hook::run() {
+            if let Err(err) = hook::run(format == "claude") {
                 eprintln!("rag hook: {err:#}");
             }
             0

@@ -34,7 +34,22 @@ rag search "where is the token renewed"
 rag serve                          # MCP stdio server
 ```
 
-Register it in `~/.zcode/cli/config.json` (user scope):
+Register it automatically in every agent found on the machine
+(Claude Code, ZCode, OpenCode, Codex):
+
+```bash
+rag install                  # global (user-level) configs of detected agents
+rag install claude codex     # only these agents (or `all`)
+rag install --local          # this project only (cwd) instead of $HOME
+rag install --dry-run        # preview; --uninstall removes; --mcp-only skips hooks
+```
+
+Claude Code and ZCode get the MCP server plus hooks; OpenCode and Codex get
+the MCP server plus a marker-delimited block in `AGENTS.md` (they have no
+shell hooks). Edits are idempotent, keep other settings, and save a one-time
+`*.rag.bak` backup. Local Claude hooks go to `.claude/settings.local.json`.
+
+Or register manually in `~/.zcode/cli/config.json` (user scope):
 
 ```json
 "rag": { "command": "C:\\path\\to\\rag.exe", "args": ["serve"] }
