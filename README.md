@@ -63,7 +63,7 @@ Restart ZCode (or Settings → MCP) afterwards. Exposed tools:
 
 | Command | What it does |
 | --- | --- |
-| `rag index [PATH]` | Build or update the index (`--force`, `--dry-run`, `--no-progress`) |
+| `rag index [PATH]` | Build or update the index (`--force`, `--dry-run`, `--no-progress`, `--no-github`) |
 | `rag search "q" [--k 5] [--judge]` | Semantic search; `--judge` returns a ready-to-run `jev_triage` payload |
 | `rag stats [PATH]` | Cost/utility report (`--reset` clears it; `--global` aggregates every indexed root) |
 | `rag status [PATH]` | Files, chunks, model, last index time |
@@ -96,6 +96,41 @@ LM Studio tips: keep an **embedding-classified** model loaded (e.g.
 `text-embedding-nomic-embed-text-v1.5`), and keep `concurrency: 1` — one
 big batch beats parallel small requests on the local engine (~18×
 degradation under contention).
+
+## GitHub metadata
+
+When the root has a GitHub `origin` remote, `rag index` also fetches its
+issues, pull requests (with commits, reviews and inline review comments),
+discussions and wiki through the authenticated `gh` CLI, renders each item as
+markdown under the index directory, and embeds them with the root's files.
+Items link to the ones closest to them (closing references, `#N` mentions),
+and `tree.md` gives the whole origin tree in one page. Sync is incremental:
+only items whose `updated_at` moved are re-fetched and rewritten.
+
+The network is only touched by explicit `rag index` / `rag_index` runs;
+background auto-refresh re-reads the cached documents. Skip it for one run
+with `--no-github`, or tune `index.github` (`enabled`, `issues`, `pulls`,
+`discussions`, `wiki`) in `config.yaml`. A failure (no `gh`, no access) is
+reported as a warning and never fails the index.
+
+## Project modules
+
+Presets for rust, python, node, java, csharp, cmake, make, go, php and ruby
+exclude dependency, cache and build trees (`target/`, `node_modules/`,
+`.venv/`, ...), each only when its marker file exists at the root. Add or
+override modules with `index.modules` in `config.yaml` or one YAML file per
+module in `<data dir>/modules/`:
+
+```yaml
+name: proto
+detect: [buf.yaml]        # path at the root, or a pattern like "*.csproj"
+exclude: ["**/gen/**"]    # never indexed while active
+p0: ["**/*.proto"]        # forced to P0
+p1: []                    # forced to P1
+```
+
+Switch presets off with `index.disabled_modules` (e.g. `[cmake]`). Active
+modules are listed in the index report.
 
 ## Hooks (optional)
 

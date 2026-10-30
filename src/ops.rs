@@ -1,7 +1,9 @@
 use crate::chunk;
 use crate::config::{self, Tier};
 use crate::files::{self, DiscoveredFile};
+use crate::github;
 use crate::lmstudio::{self, LmClient};
+use crate::modules;
 use crate::progress::{current_file, Progress};
 use crate::simd;
 use crate::stats::{self, QueryRecord, RagStats};
@@ -97,10 +99,10 @@ fn has_changes(old: &IndexData, all_files: &[DiscoveredFile], old_dim: usize) ->
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::with_capacity(all_files.len());
     for f in all_files {
         seen.insert(f.rel.as_str());
-        let unchanged = old
-            .files
-            .get(&f.rel)
-            .is_some_and(|e| files::same_state((e.mtime_ms, e.size), (f.mtime_ms, f.size)) && old_dim > 0);
+        // A tier change (config or module edit) with an untouched file still needs a run.
+        let unchanged = old.files.get(&f.rel).is_some_and(|e| {
+            files::same_state((e.mtime_ms, e.size), (f.mtime_ms, f.size)) && old_dim > 0 && e.tier == f.tier
+        });
         if !unchanged {
             return true;
         }
@@ -194,6 +196,9 @@ pub struct IndexOpts {
     pub no_progress: bool,
     /// Fully silent progress (background auto-refresh ticks).
     pub quiet: bool,
+    /// Fetch GitHub metadata from the network (explicit runs only). When off,
+    /// the previously cached GitHub documents are still indexed.
+    pub github: bool,
 }
 
 impl Default for IndexOpts {
@@ -207,6 +212,7 @@ impl Default for IndexOpts {
             no_ignore: false,
             no_progress: false,
             quiet: false,
+            github: true,
         }
     }
 }
@@ -227,7 +233,7 @@ pub async fn index(opts: IndexOpts) -> Result<String> {
 }
 
 pub(crate) async fn index_run(opts: IndexOpts) -> Result<IndexOutcome> {
-    let IndexOpts { path, force, dry_run, batch, concurrency, no_ignore, no_progress, quiet } = opts;
+    let IndexOpts { path, force, dry_run, batch, concurrency, no_ignore, no_progress, quiet, github } = opts;
     let batch = batch.unwrap_or(config::settings().index.batch_size);
     let concurrency = concurrency.unwrap_or(config::settings().index.concurrency);
     let started = Instant::now();
@@ -236,7 +242,32 @@ pub(crate) async fn index_run(opts: IndexOpts) -> Result<IndexOutcome> {
         bail!("path is not a directory: {}", root.display());
     }
     let root_str = root.to_string_lossy().replace('\\', "/");
-    let all_files = files::walk(&root, !no_ignore);
+    let index_dir = config::index_dir_for(&root);
+    let gh_settings = &config::settings().index.github;
+    let mut all_files = files::walk(&root, !no_ignore);
+    let modules = modules::Rules::for_root(&config::settings().index, &root).active;
+    let mut github_line = String::new();
+    if gh_settings.enabled {
+        if github && !dry_run {
+            if !quiet {
+                eprintln!("[rag] fetching GitHub metadata (issues, PRs, discussions, wiki)…");
+            }
+            match github::sync(&root, &index_dir, gh_settings) {
+                Ok(Some(gh)) => {
+                    github_line = format!(
+                        "\n- **GitHub {}:** {} issue(s), {} PR(s), {} discussion(s), {} wiki page(s) — {} document(s) fetched/rendered, {} removed",
+                        gh.repo, gh.issues, gh.pulls, gh.discussions, gh.wiki_pages, gh.changed, gh.removed
+                    );
+                    for warning in &gh.warnings {
+                        github_line.push_str(&format!("\n- **GitHub warning:** {warning}"));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => github_line = format!("\n- **GitHub warning:** {e:#}"),
+            }
+        }
+        all_files.extend(github::cached_files(&index_dir));
+    }
     if all_files.is_empty() {
         return Ok(IndexOutcome {
             report: format!("No indexable files found under `{root_str}`."),
@@ -277,7 +308,7 @@ pub(crate) async fn index_run(opts: IndexOpts) -> Result<IndexOutcome> {
             report: format!(
                 "## rag index — up to date\n\n\
                  - **Root:** {root_str}\n\
-                 - Nothing changed since the last index ({} file(s) checked). No embeddings, nothing written.",
+                 - Nothing changed since the last index ({} file(s) checked). No embeddings, nothing written.{github_line}",
                 all_files.len()
             ),
             changed: false,
@@ -344,7 +375,7 @@ pub(crate) async fn index_run(opts: IndexOpts) -> Result<IndexOutcome> {
     for (ti, tier) in [Tier::P0, Tier::P1].into_iter().enumerate() {
         for f in all_files.iter().filter(|f| f.tier == tier) {
             if let Some(entry) = old.as_ref().and_then(|o| o.files.get(&f.rel)) {
-                if files::same_state((entry.mtime_ms, entry.size), (f.mtime_ms, f.size)) && old_dim > 0 {
+                if files::same_state((entry.mtime_ms, entry.size), (f.mtime_ms, f.size)) && old_dim > 0 && entry.tier == f.tier {
                     copy_old_rows(old_rows, entry, old_dim, &mut vectors);
                     let mut e = entry.clone();
                     e.vec_offset = data.vector_count;
@@ -471,6 +502,11 @@ pub(crate) async fn index_run(opts: IndexOpts) -> Result<IndexOutcome> {
     } else {
         String::new()
     };
+    let modules_line = if modules.is_empty() {
+        String::new()
+    } else {
+        format!("\n- **Modules:** {}", modules.join(", "))
+    };
     let report = format!(
         "## rag index complete\n\n\
          - **Root:** {root_str}\n\
@@ -478,7 +514,7 @@ pub(crate) async fn index_run(opts: IndexOpts) -> Result<IndexOutcome> {
          - **Files in index:** {} (P0: {p0}, P1: {p1}) — {} embedded, {} unchanged, {removed} removed{reuse_line}\n\
          - **Chunks embedded:** {} (~{} tokens, {} request(s), {:.1}s, {embed_rate})\n\
          - **Total vectors:** {} | index size: {:.0} KB\n\
-         - **Wall time:** {:.1}s\n\n\
+         - **Wall time:** {:.1}s{github_line}{modules_line}\n\n\
          This root now refreshes automatically every {}s while a `rag serve` session is alive; \
          re-run manually only to force a full rebuild.",
         config::provider_name(),

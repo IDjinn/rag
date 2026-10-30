@@ -1,10 +1,12 @@
 mod chunk;
 mod config;
 mod files;
+mod github;
 mod hook;
 mod install;
 mod lmstudio;
 mod mcp;
+mod modules;
 mod ops;
 mod progress;
 mod render;
@@ -52,6 +54,9 @@ enum Command {
         /// Plain, non-interactive progress output (default when stderr is not a terminal)
         #[arg(long)]
         no_progress: bool,
+        /// Skip fetching GitHub metadata (issues, PRs, discussions, wiki) for this run
+        #[arg(long)]
+        no_github: bool,
     },
     /// Semantic search over an indexed root
     Search {
@@ -145,7 +150,7 @@ async fn main() {
 async fn run(command: Command) -> i32 {
     match command {
         Command::Serve => return mcp::serve().await,
-        Command::Index { path, force, dry_run, batch_size, concurrency, no_ignore, no_progress } => {
+        Command::Index { path, force, dry_run, batch_size, concurrency, no_ignore, no_progress, no_github } => {
             report(
                 ops::index(ops::IndexOpts {
                     path,
@@ -156,6 +161,7 @@ async fn run(command: Command) -> i32 {
                     no_ignore,
                     no_progress,
                     quiet: false,
+                    github: !no_github,
                 })
                 .await,
             )

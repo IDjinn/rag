@@ -49,6 +49,15 @@ pub struct IndexSettings {
     pub p0_globs: Vec<String>,
     /// Glob patterns classifying matching files as P1 when nothing above did.
     pub p1_globs: Vec<String>,
+    /// Glob patterns never indexed, in every root (same matching as the globs above).
+    pub exclude_globs: Vec<String>,
+    /// Extra or overriding project modules (see `modules.rs`); presets and
+    /// plugin files are always loaded, a same-named entry here replaces them.
+    pub modules: Vec<crate::modules::Module>,
+    /// Preset or plugin module names to switch off.
+    pub disabled_modules: Vec<String>,
+    /// Git metadata of the root's GitHub remote (see `github.rs`).
+    pub github: GithubSettings,
 }
 
 impl Default for IndexSettings {
@@ -67,7 +76,29 @@ impl Default for IndexSettings {
             dependency_files: list(DEPENDENCY_FILES),
             p0_globs: Vec::new(),
             p1_globs: Vec::new(),
+            exclude_globs: Vec::new(),
+            modules: Vec::new(),
+            disabled_modules: Vec::new(),
+            github: GithubSettings::default(),
         }
+    }
+}
+
+/// Which GitHub objects `rag index` pulls in (needs an authenticated `gh` for
+/// issues, pulls and discussions; wiki needs git access to `<repo>.wiki.git`).
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(default)]
+pub struct GithubSettings {
+    pub enabled: bool,
+    pub issues: bool,
+    pub pulls: bool,
+    pub discussions: bool,
+    pub wiki: bool,
+}
+
+impl Default for GithubSettings {
+    fn default() -> Self {
+        Self { enabled: true, issues: true, pulls: true, discussions: true, wiki: true }
     }
 }
 
@@ -161,6 +192,24 @@ index:
   dependency_files: {dep_files}   # never indexed (lockfiles, dependency sums)
   p0_globs: []                    # e.g. [\"**/migrations/**\", \"*.proto\"]
   p1_globs: []                    # e.g. [\"**/*.csv\", \"**/fixtures/**\"]
+  exclude_globs: []               # never indexed, any root, e.g. [\"**/generated/**\", \"*.min.js\"]
+
+  # Project modules. Built-in presets cover dependency, cache and build trees
+  # for rust, python, node, java, csharp, cmake, make, go, php and ruby; each
+  # applies only when its marker file exists at the root. Plugins: one YAML
+  # file per module in <data dir>/modules/ (same shape as an entry below).
+  # An entry here adds a module, or replaces a preset/plugin of the same name.
+  modules: []                     # see the plugin format in README.md
+  disabled_modules: []            # preset or plugin names to switch off, e.g. [\"cmake\"]
+  # GitHub metadata of the root's `origin` remote, indexed by `rag index`
+  # (not by background auto-refresh). Issues/PRs carry links to their
+  # comments, reviews, commits and closing references.
+  github:
+    enabled: true                 # `rag index --no-github` skips it for one run
+    issues: true
+    pulls: true
+    discussions: true             # needs gh GraphQL access
+    wiki: true
 
 search:
   k: 5

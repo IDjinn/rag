@@ -1,6 +1,8 @@
 use crate::config::{self, Tier};
+use crate::modules::Rules;
 use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 #[derive(Clone, Debug)]
@@ -14,7 +16,8 @@ pub struct DiscoveredFile {
 }
 
 /// Walk a root honoring .gitignore/.ignore/.git/info/exclude (nested and global),
-/// skipping hidden entries, non-whitelisted names and oversize files.
+/// skipping hidden entries, non-whitelisted names and oversize files. Excluded
+/// paths and active project modules (see `modules.rs`) apply on top.
 pub fn walk(root: &Path, respect_ignore: bool) -> Vec<DiscoveredFile> {
     let mut builder = WalkBuilder::new(root);
     builder.hidden(true);
@@ -31,6 +34,22 @@ pub fn walk(root: &Path, respect_ignore: bool) -> Vec<DiscoveredFile> {
     }
     builder.threads(std::thread::available_parallelism().map_or(4, |n| n.get()));
 
+    let rules = Arc::new(Rules::for_root(&config::settings().index, root));
+    let prune = Arc::clone(&rules);
+    let walk_root = root.to_path_buf();
+    // Excluded directories are pruned here, so vendored trees are never read.
+    builder.filter_entry(move |e| {
+        let Ok(rel) = e.path().strip_prefix(&walk_root) else {
+            return true;
+        };
+        if rel.as_os_str().is_empty() {
+            return true;
+        }
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        let is_dir = e.file_type().is_some_and(|ft| ft.is_dir());
+        !prune.excluded(&rel, is_dir)
+    });
+
     let dependency_files = &config::settings().index.dependency_files;
     let mut out: Vec<DiscoveredFile> = Vec::new();
     for entry in builder.build().flatten() {
@@ -46,7 +65,10 @@ pub fn walk(root: &Path, respect_ignore: bool) -> Vec<DiscoveredFile> {
             .unwrap_or(path)
             .to_string_lossy()
             .replace('\\', "/");
-        let Some(tier) = config::tier_for(&rel) else {
+        if rules.excluded(&rel, false) {
+            continue;
+        }
+        let Some(tier) = rules.tier_override(&rel).or_else(|| config::tier_for(&rel)) else {
             continue;
         };
         if dependency_files.iter().any(|d| d == &lower_name(name)) {

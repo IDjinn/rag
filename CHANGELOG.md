@@ -4,6 +4,26 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.8.0 — 2026-10-30
+
+### Added
+
+- **GitHub metadata in the index** — `rag index` fetches the `origin`
+  remote's issues, pull requests (commits, reviews, inline comments),
+  discussions and wiki via `gh`, renders them as cross-linked markdown (plus a
+  `tree.md` overview) and embeds them with the root's files. Incremental by
+  `updated_at`; explicit runs only (auto-refresh uses the cache). `--no-github`
+  and `index.github.*` config control it; failures are warnings.
+- **Project modules** — presets for ten languages exclude dependency, cache and
+  build trees when their marker file is present; custom modules via
+  `index.modules` or `<data dir>/modules/*.yaml`, `index.disabled_modules` to
+  opt out. `excluded`/`p0`/`p1` rules prune the walk.
+
+### Changed
+
+- A file whose tier changed (config or module edit) is re-indexed even if
+  untouched.
+
 ## 0.7.1 — 2026-10-26
 
 ### Fixed

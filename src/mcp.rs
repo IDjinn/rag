@@ -199,6 +199,7 @@ impl ServerHandler for RagServer {
                         no_ignore: args.no_ignore.unwrap_or(false),
                         quiet: false,
                         no_progress: false, // auto-downgrades to plain over stdio pipes
+                        github: true,
                     })
                     .await
                     .map_err(|e| format!("{e:#}"));
@@ -321,6 +322,8 @@ async fn auto_refresh_loop(watched: Arc<Mutex<Vec<PathBuf>>>) {
             match ops::index_run(ops::IndexOpts {
                 path: Some(root.to_string_lossy().into_owned()),
                 quiet: true,
+                // Background ticks never reach the network: GitHub documents come from the cache.
+                github: false,
                 ..Default::default()
             })
             .await
