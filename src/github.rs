@@ -910,9 +910,9 @@ pub fn sync(root: &Path, index_dir: &Path, cfg: &GithubSettings) -> Result<Optio
     }
     for (name, content) in &wiki {
         let header = format!(
-            "# Wiki: {}\n\nSource: https://github.com/{}/wiki\n\n",
-            name.trim_end_matches(".md"),
-            repo.slug()
+            "# Wiki: {page}\n\nSource: https://github.com/{}/wiki/{page}\n\n",
+            repo.slug(),
+            page = name.trim_end_matches(".md"),
         );
         writes.insert(format!("wiki/{name}"), format!("{header}{content}"));
     }
@@ -946,6 +946,16 @@ pub fn sync(root: &Path, index_dir: &Path, cfg: &GithubSettings) -> Result<Optio
         removed,
         warnings,
     }))
+}
+
+/// Title (first heading) and web link of a materialized document, for search
+/// results: issues, PRs and discussions carry `- **URL:**`, wiki pages `Source:`.
+pub fn describe(content: &str) -> (Option<String>, Option<String>) {
+    let title = content.lines().find_map(|l| l.strip_prefix("# ")).map(|t| t.trim().to_string());
+    let url = content.lines().take(20).find_map(|l| {
+        l.strip_prefix("- **URL:** ").or_else(|| l.strip_prefix("Source: ")).map(|u| u.trim().to_string())
+    });
+    (title, url)
 }
 
 /// The cached GitHub documents as indexable files. Reads the disk only, so it
@@ -994,6 +1004,17 @@ mod tests {
 
     fn pr_thread(n: u64, body: &str) -> Thread {
         Thread { number: n, is_pr: true, title: "t".into(), body: body.into(), detailed: true, ..Thread::default() }
+    }
+
+    #[test]
+    fn describes_issue_and_wiki_documents() {
+        let issue = "# Issue #3: Broken search\n\n- **State:** open\n- **URL:** https://github.com/o/r/issues/3\n";
+        assert_eq!(
+            describe(issue),
+            (Some("Issue #3: Broken search".to_string()), Some("https://github.com/o/r/issues/3".to_string()))
+        );
+        let wiki = "# Wiki: Home\n\nSource: https://github.com/o/r/wiki/Home\n\nbody";
+        assert_eq!(describe(wiki).1.as_deref(), Some("https://github.com/o/r/wiki/Home"));
     }
 
     #[test]

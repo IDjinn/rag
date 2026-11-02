@@ -822,6 +822,13 @@ pub async fn search(query: &str, k: Option<usize>, path: Option<&str>, judge: bo
     scored.truncate(k.max(1));
     let elapsed = started.elapsed().as_millis() as u64;
 
+    // Only confident matches are listed; the rest is summarized in a note.
+    let top_score = scored.first().map_or(0.0, |(s, _, _)| *s);
+    let min_score = config::settings().search.min_score;
+    let cut = scored.partition_point(|(s, _, _)| *s >= min_score);
+    let low = scored.split_off(cut);
+    let index_dir = config::index_dir_for(&root);
+
     let mut out = String::new();
     let mut delivered_chars = 0usize;
     let mut full_file_chars = 0usize;
@@ -829,17 +836,27 @@ pub async fn search(query: &str, k: Option<usize>, path: Option<&str>, judge: bo
     let mut judge_items: Vec<serde_json::Value> = Vec::new();
 
     if scored.is_empty() {
-        out.push_str(&format!("No results for \"{query}\".\n"));
+        if low.is_empty() {
+            out.push_str(&format!("No results for \"{query}\".\n\n"));
+        } else {
+            out.push_str(&format!("No confident matches for \"{query}\" (score ≥ {min_score:.2}).\n\n"));
+        }
     }
     for (rank, (score, fi, ci)) in scored.iter().enumerate() {
         let (rel, entry) = file_list[*fi as usize];
         let id = format!("r{}", rank + 1);
-        let mut abs = root.clone();
+        // GitHub documents live in the index directory, not in the root.
+        let is_github = rel.starts_with(&format!("{}/", github::DIR));
+        let mut abs = if is_github { index_dir.clone() } else { root.clone() };
         for part in rel.split('/') {
             abs.push(part);
         }
+        let mut github_card: Option<(Option<String>, Option<String>)> = None;
         let (snippet, stale, file_chars) = match std::fs::read_to_string(&abs) {
             Ok(content) => {
+                if is_github {
+                    github_card = Some(github::describe(&content));
+                }
                 let lines: Vec<&str> = content.lines().collect();
                 let start = entry.chunks[*ci as usize].start.saturating_sub(1);
                 let end = (entry.chunks[*ci as usize].end).min(lines.len());
@@ -871,13 +888,21 @@ pub async fn search(query: &str, k: Option<usize>, path: Option<&str>, judge: bo
             full_file_chars += file_chars;
         }
         let tier_badge = entry.tier.as_str();
-        out.push_str(&format!(
-            "### {id}. [{tier_badge}] {rel}:{}-{} — score {:.3}{}\n\n```\n{snippet}\n```\n\n",
-            entry.chunks[*ci as usize].start,
-            entry.chunks[*ci as usize].end,
-            score,
-            if stale { " ⚠️ changed since indexing" } else { "" }
-        ));
+        let (start, end) = (entry.chunks[*ci as usize].start, entry.chunks[*ci as usize].end);
+        let stale_note = if stale { " ⚠️ changed since indexing" } else { "" };
+        match github_card {
+            Some((title, url)) => {
+                let title = title.unwrap_or_else(|| rel.clone());
+                out.push_str(&format!("### {id}. [GitHub] {title} — score {score:.3}{stale_note}\n\n"));
+                if let Some(url) = url {
+                    out.push_str(&format!("🔗 {url}\n"));
+                }
+                out.push_str(&format!("📄 {rel}:{start}-{end}\n\n{snippet}\n\n"));
+            }
+            None => out.push_str(&format!(
+                "### {id}. [{tier_badge}] {rel}:{start}-{end} — score {score:.3}{stale_note}\n\n```\n{snippet}\n```\n\n"
+            )),
+        }
         judge_items.push(serde_json::json!({
             "id": id,
             "path": abs.to_string_lossy(),
@@ -887,7 +912,6 @@ pub async fn search(query: &str, k: Option<usize>, path: Option<&str>, judge: bo
 
     let delivered = est_tokens(delivered_chars);
     let full = est_tokens(full_file_chars);
-    let top_score = scored.first().map_or(0.0, |(s, _, _)| *s);
 
     {
         let _store_guard = lock_store(&locks);
@@ -915,6 +939,15 @@ pub async fn search(query: &str, k: Option<usize>, path: Option<&str>, judge: bo
             },
         );
         stats::save(&store.dir, &s);
+    }
+
+    if !low.is_empty() {
+        let best = low.first().map_or(0.0, |(s, _, _)| *s);
+        out.push_str(&format!(
+            "⚠️ {} more low-confidence match(es) hidden (best score {best:.3} < {min_score:.2}). \
+             Lower `search.min_score` in config.yaml to list them.\n\n",
+            low.len()
+        ));
     }
 
     out.push_str(&format!(

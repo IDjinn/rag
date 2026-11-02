@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.8.1 — 2026-11-02
+
+### Changed
+
+- **GitHub results in `rag search`** — issues, PRs, discussions and wiki pages
+  are now read from the index directory (they showed as "file missing" before)
+  and rendered with their title and web link instead of a code block with a
+  bare path. Wiki pages now link to their own page.
+- **Low-confidence filtering** — only results with a score at or above
+  `search.min_score` (default 0.4) are listed; a note reports how many weaker
+  matches were hidden and the best hidden score.
+
 ## 0.8.0 — 2026-10-30
 
 ### Added

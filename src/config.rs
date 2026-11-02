@@ -114,12 +114,14 @@ pub struct SearchSettings {
     pub p1_damp: f32,
     /// Cosine score at or above which a search counts as a "hit" in stats.
     pub hit_threshold: f32,
+    /// Results scoring below this are not listed; a note reports how many were hidden.
+    pub min_score: f32,
     pub snippet_max_chars: usize,
 }
 
 impl Default for SearchSettings {
     fn default() -> Self {
-        Self { k: 5, p1_damp: 0.9, hit_threshold: 0.3, snippet_max_chars: 1600 }
+        Self { k: 5, p1_damp: 0.9, hit_threshold: 0.3, min_score: 0.4, snippet_max_chars: 1600 }
     }
 }
 
@@ -215,6 +217,7 @@ search:
   k: 5
   p1_damp: 0.9                    # score multiplier for P1 (non source/md) results
   hit_threshold: 0.3
+  min_score: 0.4                  # results below this are hidden behind a low-confidence note
   snippet_max_chars: 1600
 ",
         p0_exts = yaml_list(&IndexSettings::default().p0_exts),
